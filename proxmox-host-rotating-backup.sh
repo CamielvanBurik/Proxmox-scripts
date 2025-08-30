@@ -75,6 +75,75 @@ trap unlock EXIT
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+
+print_help() {
+  cat <<EOF
+Proxmox host rotating backup — gebruik:
+  $0 [opties]
+
+Opties:
+  -h, --help
+      Toon deze hulp en stop.
+
+  --force {S|M|H|weekly|monthly|semiannual}
+      Forceer type run: S=weekly, M=monthly, H=semiannual.
+      Bij M/H wordt eerst S gedraaid.
+
+  --cleanup
+      Alleen opschonen (geen nieuwe back-ups).
+
+  --verify
+      Controleer checksums (.b3/.sha256) voor *.gz en *.xz in $BASE_DIR.
+      Exit 1 bij mismatches.
+
+  --self-test
+      Niet-invasieve systeemcheck (tools, IO, permissies). Geen echte back-ups.
+
+  --snapshot-only [NAAM]
+      Maak alleen een snapshot en laat die staan.
+      ZFS: DATASET@NAAM (of automatisch 'manual-YYYYmmdd-HHMMSS').
+      LVM: LV-snapshot 'manualsnap-NAAM'.
+
+  --snapshot [NAAM]
+      Maak snapshot en dump/compress naar $MANUAL_DIR; snapshot blijft bestaan.
+      ZFS: zfs send + compressie.
+      LVM: partclone (ext4/xfs) of dd fallback.
+
+  --snapshot-delete NAAM
+      Verwijder snapshot (ZFS of LVM). Bij ZFS mag je ook pool/dataset@naam doorgeven.
+
+Belangrijke paden / retentie:
+  BASE_DIR:       $BASE_DIR
+  Weekly dir:     $W_DIR        (retentie: $RETENTION_WEEKLY)
+  Monthly dir:    $M_DIR        (retentie: $RETENTION_MONTHLY)
+  Semiannual dir: $H_DIR        (retentie: $RETENTION_SEMIANNUAL)
+  Manual dir:     $MANUAL_DIR   (retentie: $RETENTION_MANUAL)
+  Log:            $LOG_FILE
+
+Overig:
+  Root FS:        type=$ROOT_FSTYPE  source=$ROOT_SOURCE
+  LVM snap size:  $LVM_SNAP_SIZE  (vrije VG-ruimte wordt vooraf gecheckt)
+  Compressor:     pigz indien aanwezig, anders gzip. Full-disk gebruikt xz als die aanwezig is.
+
+Voorbeelden:
+  $0 --force S
+  $0 --force M
+  $0 --cleanup
+  $0 --snapshot-only mylabel
+  $0 --snapshot mylabel
+  $0 --snapshot-delete rootsnap-S-2025-08-30
+  $0 --verify
+  $0 --self-test
+EOF
+}
+
+
+
+
+
+
+
+
 pkgmgr_detect() {
   if have_cmd apt-get; then echo apt; return 0
   elif have_cmd dnf; then echo dnf; return 0
@@ -640,6 +709,11 @@ if [[ -n "$SNAPSHOT_DELETE_NAME" ]]; then
   log "=== Snapshot-delete gestart $TODAY ==="
   snapshot_delete "$SNAPSHOT_DELETE_NAME"
   log "=== Snapshot-delete klaar ==="
+  exit 0
+fi
+
+if $SHOW_HELP; then
+  print_help
   exit 0
 fi
 
