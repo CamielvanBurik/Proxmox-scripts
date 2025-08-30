@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =========================================
-# Proxmox host rotating backup 
+# Proxmox host rotating backup (refactor + fixes + self-test + partclone + auto-install)
 # - Weekly / Monthly / Semiannual (ZFS & LVM)
 # - --snapshot-only [NAAM]   (alleen snapshot bewaren)
 # - --snapshot [NAAM]        (snapshot + dump; snapshot blijft staan; dump in MANUAL_DIR)
@@ -11,22 +11,23 @@ set -euo pipefail
 # - --verify                 (alle archieven via checksum controleren; exit 1 bij mismatch)
 # - --self-test              (niet-invasieve systeemcheck)
 # - LVM-dumps: partclone (ext4/xfs) -> kleiner & sneller; fallback naar dd
+# - Full-disk dumps: sparse .img (+conv=sparse) -> atomisch .img.xz
 # - Atomisch wegschrijven + checksums (b3sum of sha256sum)
-# - Auto-install: partclone & pigz (als root; apt/dnf/yum/zypper/pacman)
+# - Auto-install: partclone, pigz, xz (als root; apt/dnf/yum/zypper/pacman)
 # =========================================
 
 # ========= Config =========
-BASE_DIR="/mnt/pve/BackupHD/HDproxmox-host" #backup locatie
+BASE_DIR="/mnt/pve/BackupHD/HDproxmox-host"
 W_DIR="$BASE_DIR/weekly"
 M_DIR="$BASE_DIR/monthly"
 H_DIR="$BASE_DIR/semiannual"
 MANUAL_DIR="$BASE_DIR/manual"
 QUARANTINE_DIR="$BASE_DIR/quarantine"
 
-RETENTION_WEEKLY=6   # aantal weeklijkse dumps (*.gz
-RETENTION_MONTHLY=6  # aantal weeklijkse dumps (*.gz
-RETENTION_SEMIANNUAL=2 # aantal weeklijkse dumps (*.gz
-RETENTION_MANUAL=2           # aantal manual dumps (*.gz) bewaren
+RETENTION_WEEKLY=6
+RETENTION_MONTHLY=6
+RETENTION_SEMIANNUAL=2
+RETENTION_MANUAL=12           # aantal manual dumps (*.gz|*.xz) bewaren
 
 ZFS_ROOT_DATASET_DEFAULT="rpool/ROOT/pve-1"
 LVM_SNAP_SIZE="10G"           # COW size (bv. 10G of 1024M)
@@ -120,17 +121,22 @@ try_install_pkgs() {
 }
 
 ensure_tools() {
-  local want=()
+  local want=() mgr
+  mgr="$(pkgmgr_detect || true)"
+
   # pigz (sneller comprimeren)
   if ! have_cmd pigz; then want+=("pigz"); fi
   # partclone (used-blocks dump voor ext4/xfs)
   if ! have_cmd partclone.extfs && ! have_cmd partclone.xfs; then want+=("partclone"); fi
+  # xz (voor sparse raw -> .xz compressie)
+  if ! have_cmd xz; then
+    if [[ "$mgr" == "apt" ]]; then want+=("xz-utils"); else want+=("xz"); fi
+  fi
 
   if (( ${#want[@]} )); then
     try_install_pkgs "${want[@]}" || log "Auto-install: installatie mislukt of niet mogelijk; ga door met bestaande tools"
   fi
-
-  # als b3sum ontbreekt maar sha256sum aanwezig is, laten we dat zo; b3sum installeren we niet automatisch
+  # b3sum installeren we niet automatisch; sha256sum is vrijwel altijd aanwezig.
 }
 
 compressor() { have_cmd pigz && echo pigz || echo gzip; }
@@ -358,20 +364,55 @@ snapshot_delete() {
   fi
 }
 
+# ========= NIEUW: full-disk -> sparse raw + xz =========
 full_disk_backup() {
   local type="$1" outdir="$2"
-  local rootdev pk base outfile
+  local rootdev pk base rawfile outfile
+
   rootdev="$(findmnt -no SOURCE /)"
   pk="$(lsblk -no PKNAME "$rootdev" 2>/dev/null || true)"
   base="${pk:+/dev/$pk}"; [[ -n "$base" ]] || base="$rootdev"
   [[ -b "$base" ]] || fail "Kon fysieke disk niet bepalen ($base)"
-  outfile="${outdir}/${HOST}-disk-${type}-${TODAY}.img.gz"
-  log "Disk image: $base -> $outfile"
-  dd if="$base" bs=64M status=progress \
-    | $COMP \
-    | write_atomic_from_stdin "$outfile" \
-    || fail "dd van volledige disk mislukt"
-  log "OK: $outfile"
+
+  rawfile="${outdir}/${HOST}-disk-${type}-${TODAY}.img"      # tijdelijk raw (sparse)
+  outfile="${rawfile}.xz"                                    # eindresultaat
+
+  # Optioneel: TRIM vooraf (kan compressie/sparseness helpen op SSD's)
+  if command -v fstrim >/dev/null 2>&1; then
+    log "TRIM: fstrim -av (pre-image)"
+    fstrim -av >>"$LOG_FILE" 2>&1 || log "Waarschuwing: fstrim faalde; ga door"
+  else
+    log "TRIM: fstrim niet gevonden; sla over"
+  fi
+
+  log "Disk raw sparse image: $base -> $rawfile"
+  if ! dd if="$base" of="$rawfile" bs=64M status=progress conv=sparse; then
+    rm -f -- "$rawfile" 2>/dev/null || true
+    fail "dd van volledige disk mislukt"
+  fi
+
+  if command -v xz >/dev/null 2>&1; then
+    log "Compress (xz --threads=0 --sparse): $rawfile -> $outfile"
+    if xz --threads=0 --sparse -c "$rawfile" | write_atomic_from_stdin "$outfile"; then
+      rm -f -- "$rawfile" 2>/dev/null || true
+      log "OK: $outfile"
+    else
+      rm -f -- "$outfile.part" 2>/dev/null || true
+      log "Let op: raw image blijft staan voor diagnose: $rawfile"
+      fail "xz compressie mislukt"
+    fi
+  else
+    local gz_out="${rawfile}.gz"
+    log "xz ontbreekt; fallback compress ($COMP): $rawfile -> $gz_out"
+    if cat "$rawfile" | $COMP | write_atomic_from_stdin "$gz_out"; then
+      rm -f -- "$rawfile" 2>/dev/null || true
+      log "OK: $gz_out"
+    else
+      rm -f -- "$gz_out.part" 2>/dev/null || true
+      log "Let op: raw image blijft staan voor diagnose: $rawfile"
+      fail "fallback compressie mislukt"
+    fi
+  fi
 }
 
 create_backup() {
@@ -406,7 +447,8 @@ create_backup() {
 # ========= Retentie & Cleanup =========
 prune_dir() {
   local dir="$1" keep="$2" files=()
-  mapfile -t files < <(ls -1t "$dir"/*.gz 2>/dev/null || true)
+  # Tel zowel .gz als .xz (laatste eerst)
+  mapfile -t files < <(ls -1t "$dir"/*.gz "$dir"/*.xz 2>/dev/null || true)
   (( ${#files[@]} <= keep )) && return 0
   for f in "${files[@]:$keep}"; do
     log "Retentie: verwijder $f"
@@ -438,7 +480,7 @@ cleanup_archives() {
           2) : ;;
         esac
       fi
-    done < <(find "$BASE_DIR" -type f -name '*.gz' -print0 2>/dev/null)
+    done < <(find "$BASE_DIR" -type f \( -name '*.gz' -o -name '*.xz' \) -print0 2>/dev/null)
   fi
 }
 
@@ -479,7 +521,7 @@ verify_archives() {
     else
       [[ $? -eq 1 ]] && ((bad++))
     fi
-  done < <(find "$BASE_DIR" -type f -name '*.gz' -print0 2>/dev/null)
+  done < <(find "$BASE_DIR" -type f \( -name '*.gz' -o -name '*.xz' \) -print0 2>/dev/null)
   log "Verify: total=$total ok=$ok mismatch=$bad missing=$missing created=$created"
   [[ $bad -eq 0 ]]
 }
@@ -496,6 +538,7 @@ self_test() {
   have_cmd "$COMP" || fail "Compressor ontbreekt: $COMP"
   have_cmd lvs || log "Let op: lvm2 tooling (lvs) niet gevonden; LVM-functionaliteit beperkt"
   have_cmd zfs || true
+  have_cmd xz  && log "xz aanwezig" || log "xz ontbreekt (full-disk fallback gebruikt compressor $COMP)"
 
   # partclone info
   have_cmd partclone.extfs && log "partclone.extfs aanwezig"
@@ -503,10 +546,14 @@ self_test() {
 
   echo "ok" | $COMP >/dev/null || fail "Compressor faalde: $COMP"
 
-  local tdir="$W_DIR" tfile="$tdir/.selftest-${NOWHM}"
+  local tdir tfile
+  tdir="$W_DIR"
+  tfile="${tdir}/.selftest-${NOWHM}"
   echo "hello-selftest" | write_atomic_from_stdin "$tfile"
   [[ -s "$tfile" ]] || fail "Atomisch wegschrijven faalde ($tfile niet aangemaakt)"
-  if [[ -n "$CHECKSUM_CMD" ]]; then verify_checksum "$tfile" || true; fi
+  if [[ -n "$CHECKSUM_CMD" ]]; then
+    verify_checksum "$tfile" || true
+  fi
   rm -f -- "$tfile" "${tfile}.b3" "${tfile}.sha256" 2>/dev/null || true
 
   [[ -n "$ROOT_FSTYPE" ]] || fail "Kon root FSTYPE niet bepalen"
