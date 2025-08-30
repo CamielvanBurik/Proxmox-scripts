@@ -51,7 +51,7 @@ while (("$#")); do
     --no-fzf) NO_FZF=true ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Onbekende optie: $1"; usage; exit 1 ;;
-  endcase
+  esac
   shift
 done
 
