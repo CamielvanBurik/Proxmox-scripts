@@ -8,6 +8,7 @@ set -euo pipefail
 REPO_URL="${REPO_URL:-https://github.com/CamielvanBurik/Proxmox-scripts}"
 CACHE_DIR="${CACHE_DIR:-$HOME/.cache/proxmox-scripts}"
 REPO_DIR="$CACHE_DIR/repo"
+SELF_NAME="$(basename "$0")"
 
 DRY_RUN=false
 FORCE_UPDATE=true
@@ -130,8 +131,18 @@ sync_repo() {
 
 find_scripts() {
   # *.sh of executable files; filter .git/.github
+  # Sla dit script zelf over: 'scripts-menu.sh' en de basename van $0
   find "$REPO_DIR" -type f \( -name "*.sh" -o -perm -111 \) \
     ! -path "*/.git/*" ! -path "*/.github/*" 2>/dev/null \
+  | awk -v repo="$REPO_DIR" -v self1="scripts-menu.sh" -v self2="$SELF_NAME" '
+      {
+        # basename
+        n=$0
+        sub(/^.*\//,"",n)
+        if (n==self1 || n==self2) next
+        print
+      }
+    ' \
   | sort
 }
 
