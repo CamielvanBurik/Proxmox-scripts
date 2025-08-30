@@ -128,4 +128,119 @@ ssh_base_opts(){
   printf "%q " "${o[@]}"
 }
 ssh_run(){
+  local host="$1"; shift
+  # shellcheck disable=SC2046
+  ssh $(ssh_base_opts) "$SSH_USER@$host" "$@"
+}
+ssh_sudo_prefix(){ [[ "$SSH_USER" == "root" ]] && echo "" || echo "sudo "; }
+ssh_detect_pkgmgr(){
   local host="$1"
+  ssh_run "$host" "bash -lc 'command -v apt >/dev/null && echo apt || command -v dnf >/dev/null && echo dnf || command -v yum >/dev/null && echo yum || command -v zypper >/dev/null && echo zypper || command -v pacman >/dev/null && echo pacman || echo none'"
+}
+
+ssh_install_guest_agent(){
+  local host="$1" mgr sudo; mgr="$(ssh_detect_pkgmgr "$host")"; sudo="$(ssh_sudo_prefix)"
+  case "$mgr" in
+    apt)    ssh_run "$host" "bash -lc '${sudo}DEBIAN_FRONTEND=noninteractive apt -y update && ${sudo}apt -y install qemu-guest-agent && ${sudo}systemctl enable --now qemu-guest-agent'";;
+    dnf)    ssh_run "$host" "bash -lc '${sudo}dnf -y install qemu-guest-agent && ${sudo}systemctl enable --now qemu-guest-agent'";;
+    yum)    ssh_run "$host" "bash -lc '${sudo}yum -y install qemu-guest-agent && ${sudo}systemctl enable --now qemu-guest-agent'";;
+    zypper) ssh_run "$host" "bash -lc '${sudo}zypper --non-interactive install qemu-guest-agent && ${sudo}systemctl enable --now qemu-guest-agent'";;
+    pacman) ssh_run "$host" "bash -lc '${sudo}pacman -Sy --noconfirm qemu-guest-agent && ${sudo}systemctl enable --now qemu-guest-agent'";;
+    *)      log "VM($host): onbekende package manager; kan agent niet installeren"; return 1;;
+  esac
+}
+
+# ----- VM selectiemenu -----
+find_vms_lines(){
+  local ids lines=()
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    local st nm ag mark
+    st="$(vm_status "$id" 2>/dev/null || true)"
+    nm="$(vm_name_from_list "$id" 2>/dev/null || true)"
+    ag="$(vm_agent_enabled "$id" 2>/dev/null || echo no)"
+    [[ "$ag" == "yes" ]] && mark="✓" || mark="✗"
+    lines+=("$(printf "%-5s [%-1s] %-28s | status:%-8s | agent:%s" "$id" "$mark" "${nm:-unknown}" "${st:-unknown}" "$ag")")
+  done < <(qm_list_vmids)
+  printf "%s\n" "${lines[@]}"
+}
+
+menu_choose_vms(){
+  mapfile -t LINES < <(find_vms_lines)
+  ((${#LINES[@]})) || fail "Geen VM's gevonden."
+  if ensure_fzf; then
+    local sel
+    sel="$(printf "%s\n" "${LINES[@]}" \
+      | fzf -m --prompt="Selecteer VM's > " \
+             --header="Spatie=selecteer, Enter=bevestig | [✓]=agent enabled in config" \
+             --height=90% --border --ansi \
+             --preview 'echo {}' --preview-window=down,10%)" || true
+    [[ -n "$sel" ]] || fail "Geen selectie gemaakt."
+    printf "%s\n" "$sel" | awk '{print $1}'
+    return 0
+  fi
+  >&2 echo "Beschikbare VM's:"
+  local i=1; for l in "${LINES[@]}"; do >&2 printf "  [%2d] %s\n" "$i" "$l"; ((i++)); done
+  >&2 echo
+  >&2 echo "Kies meerdere met nummers of VMIDs, gescheiden door spaties. Of typ 'all'."
+  local sel; read -r -p "Keuze: " sel
+  if [[ "$sel" == "all" ]]; then
+    printf "%s\n" $(qm_list_vmids); return 0
+  fi
+  local ids=() total=$((i-1))
+  for tok in $sel; do
+    if [[ "$tok" =~ ^[0-9]+$ ]]; then
+      if (( tok>=1 && tok<=total )); then
+        local id; id="$(printf "%s\n" "${LINES[tok-1]}" | awk '{print $1}')" ; ids+=("$id")
+      elif qm_list_vmids | grep -qx "$tok"; then
+        ids+=("$tok")
+      else
+        >&2 echo "  - Onbekende keuze: $tok (genegeerd)"
+      fi
+    else
+      >&2 echo "  - Ongeldig: $tok (genegeerd)"
+    fi
+  done
+  ((${#ids[@]})) || fail "Geen geldige keuze."
+  printf "%s\n" "${ids[@]}"
+}
+
+# ----- Main flow per VM -----
+process_vm(){
+  local id="$1"
+  log "=== VM $id ==="
+  vm_enable_agent "$id" || true
+  if ! vm_is_running "$id"; then
+    read -r -p "VM $id is niet running. Starten om via SSH te kunnen installeren? [Y/n] " yn
+    [[ "${yn:-Y}" =~ ^([Yy]|)$ ]] || { log "VM $id overgeslagen (VM is stopped)."; return 0; }
+    qm start "$id" >/dev/null || fail "Kon VM $id niet starten"
+    sleep 2
+  fi
+  local ip; ip="$(vm_prompt_ip "$id")"
+  log "VM $id: installeer qemu-guest-agent via SSH op $SSH_USER@$ip (port $SSH_PORT)…"
+  ssh_install_guest_agent "$ip" || fail "VM $id: installatie via SSH faalde"
+  log "VM $id: klaar."
+}
+
+main(){
+  have qm || fail "Dit script moet op de Proxmox host draaien (qm vereist)."
+  log "== Proxmox VM Guest Agent Setup (geen mounts) =="
+
+  # Vraag 1x naar SSH-parameters (met defaults)
+  read -r -p "SSH user voor VM's [$SSH_USER]: " a; SSH_USER="${a:-$SSH_USER}"
+  read -r -p "SSH port voor VM's [$SSH_PORT]: " a; SSH_PORT="${a:-$SSH_PORT}"
+  read -r -p "Pad naar SSH key (Enter voor default/agent): " a; SSH_KEY="${a:-$SSH_KEY}"
+  echo "SSH: user=${SSH_USER} port=${SSH_PORT} key=${SSH_KEY:-<default>} strict=$SSH_STRICT timeout=$SSH_CONNECT_TIMEOUT"
+
+  mapfile -t vmids < <(menu_choose_vms)
+  echo "Gekozen VMIDs: ${vmids[*]}"
+  read -r -p "Doorvoeren voor deze VM's? [Y/n] " go
+  [[ "${go:-Y}" =~ ^([Yy]|)$ ]] || fail "Afgebroken."
+
+  for id in "${vmids[@]}"; do
+    process_vm "$id" || log "VM $id: fout (zie log)"
+  done
+  log "=== Klaar ==="
+}
+
+main "$@"
