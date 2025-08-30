@@ -11,7 +11,7 @@ set -euo pipefail
 # - --verify                 (alle archieven via checksum controleren; exit 1 bij mismatch)
 # - --self-test              (niet-invasieve systeemcheck)
 # - LVM-dumps: partclone (ext4/xfs) -> kleiner & sneller; fallback naar dd
-# - Full-disk dumps: sparse .img (+conv=sparse) -> atomisch .img.xz
+# - Full-disk dumps: sparse .img (+conv=sparse) -> atomisch .img.xz (fallback .img.gz)
 # - Atomisch wegschrijven + checksums (b3sum of sha256sum)
 # - Auto-install: partclone, pigz, xz (als root; apt/dnf/yum/zypper/pacman)
 # =========================================
@@ -65,6 +65,8 @@ ROOT_SOURCE="$(findmnt -no SOURCE / || true)"
 
 CHECKSUM_CMD=""; CHECKSUM_EXT=""
 COMP=""   # pigz of gzip
+
+SHOW_HELP=false
 # ==========================
 
 # ========= Utils =========
@@ -74,7 +76,6 @@ unlock()   { [[ -f "$LOCK_FILE" ]] && rm -f "$LOCK_FILE"; }
 trap unlock EXIT
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
-
 
 print_help() {
   cat <<EOF
@@ -137,13 +138,6 @@ Voorbeelden:
 EOF
 }
 
-
-
-
-
-
-
-
 pkgmgr_detect() {
   if have_cmd apt-get; then echo apt; return 0
   elif have_cmd dnf; then echo dnf; return 0
@@ -154,7 +148,6 @@ pkgmgr_detect() {
 }
 
 try_install_pkgs() {
-  # Args: pkgs...
   [[ "$AUTO_INSTALL_PKGS" == "true" ]] || return 1
   (( EUID == 0 )) || { log "Auto-install: root vereist; sla installatie over"; return 1; }
   local mgr; mgr="$(pkgmgr_detect || true)"
@@ -192,20 +185,12 @@ try_install_pkgs() {
 ensure_tools() {
   local want=() mgr
   mgr="$(pkgmgr_detect || true)"
-
-  # pigz (sneller comprimeren)
   if ! have_cmd pigz; then want+=("pigz"); fi
-  # partclone (used-blocks dump voor ext4/xfs)
   if ! have_cmd partclone.extfs && ! have_cmd partclone.xfs; then want+=("partclone"); fi
-  # xz (voor sparse raw -> .xz compressie)
   if ! have_cmd xz; then
     if [[ "$mgr" == "apt" ]]; then want+=("xz-utils"); else want+=("xz"); fi
   fi
-
-  if (( ${#want[@]} )); then
-    try_install_pkgs "${want[@]}" || log "Auto-install: installatie mislukt of niet mogelijk; ga door met bestaande tools"
-  fi
-  # b3sum installeren we niet automatisch; sha256sum is vrijwel altijd aanwezig.
+  (( ${#want[@]} )) && try_install_pkgs "${want[@]}" || log "Auto-install: installatie mislukt of niet mogelijk; ga door met bestaande tools"
 }
 
 compressor() { have_cmd pigz && echo pigz || echo gzip; }
@@ -241,18 +226,12 @@ verify_checksum() {
 
 write_atomic_from_stdin() {
   local target="${1:-}"
-  if [[ -z "$target" ]]; then
-    log "INTERNAL: write_atomic_from_stdin zonder target aangeroepen"
-    return 1
-  fi
+  [[ -n "$target" ]] || { log "INTERNAL: write_atomic_from_stdin zonder target"; return 1; }
   local dir tmp
   dir="$(dirname -- "$target")"
   tmp="${target}.part"
   [[ -d "$dir" && -w "$dir" ]] || fail "Doelmap niet (schrijfbaar): $dir"
-  if ! cat > "$tmp"; then
-    rm -f -- "$tmp" 2>/dev/null || true
-    return 1
-  fi
+  if ! cat > "$tmp"; then rm -f -- "$tmp" 2>/dev/null || true; return 1; fi
   sync -f "$tmp" 2>/dev/null || true
   mv -f -- "$tmp" "$target"
   [[ "$CHECKSUM_CREATE_ON_WRITE" == "true" ]] && write_checksum "$target"
@@ -284,35 +263,25 @@ zfs_dataset_root() {
   [[ -z "$ds" ]] && ds="$ZFS_ROOT_DATASET_DEFAULT"
   echo "$ds"
 }
-# ==========================
 
-# ========= Dump helper (partclone + fallback dd) =========
+# ========= Dump helper =========
 dump_block_device_smart() {
-  # Args: <DEV> <OUTFILE> <COMP_CMD> <FSTYPE>
   local DEV="$1" OUTFILE="$2" COMP_CMD="$3" FST="$4"
   [[ -n "$OUTFILE" ]] || fail "Internal: OUTFILE is leeg (dump_block_device_smart)"
   if [[ "$FST" == "ext4" && -x "$(command -v partclone.extfs || true)" ]]; then
     log "Dump (partclone.extfs) -> $OUTFILE"
-    partclone.extfs -c -s "$DEV" -o - \
-      | $COMP_CMD \
-      | write_atomic_from_stdin "$OUTFILE"
+    partclone.extfs -c -s "$DEV" -o - | $COMP_CMD | write_atomic_from_stdin "$OUTFILE"
   elif [[ "$FST" == "xfs" && -x "$(command -v partclone.xfs || true)" ]]; then
     log "Dump (partclone.xfs) -> $OUTFILE"
-    partclone.xfs -c -s "$DEV" -o - \
-      | $COMP_CMD \
-      | write_atomic_from_stdin "$OUTFILE"
+    partclone.xfs  -c -s "$DEV" -o - | $COMP_CMD | write_atomic_from_stdin "$OUTFILE"
   else
     log "Dump (dd fallback) -> $OUTFILE"
-    dd if="$DEV" bs=64M status=progress \
-      | $COMP_CMD \
-      | write_atomic_from_stdin "$OUTFILE"
+    dd if="$DEV" bs=64M status=progress | $COMP_CMD | write_atomic_from_stdin "$OUTFILE"
   fi
 }
-# ========================================================
 
 # ========= Low-level snapshot/dump =========
 createsnapshot() {
-  # Args: <VG> <LV> <SNAP_NAME> <OUTFILE> <COMP_CMD> [KEEP=false|true]
   local VG="$1" LV="$2" SNAP_NAME="$3" OUTFILE="$4" COMP_CMD="$5" KEEP="${6:-false}"
   local SNAP_PATH="/dev/${VG}/${SNAP_NAME}"
   [[ -n "$OUTFILE" ]] || fail "Internal: OUTFILE is leeg (createsnapshot)"
@@ -336,7 +305,6 @@ createsnapshot() {
 }
 
 zfs_send_snapshot() {
-  # Args: <DATASET> <SNAP_NAME> <OUTFILE> <COMP_CMD> [KEEP=false|true]
   local DATASET="$1" SNAP_NAME="$2" OUTFILE="$3" COMP_CMD="$4" KEEP="${5:-false}"
   local SNAPSHOT="${DATASET}@${SNAP_NAME}"
   have_cmd zfs || fail "zfs niet gevonden"
@@ -346,9 +314,7 @@ zfs_send_snapshot() {
   zfs snapshot "$SNAPSHOT" || fail "ZFS snapshot mislukt"
 
   log "ZFS: send -> $OUTFILE"
-  if zfs send -c "$SNAPSHOT" \
-     | $COMP_CMD \
-     | write_atomic_from_stdin "$OUTFILE"; then
+  if zfs send -c "$SNAPSHOT" | $COMP_CMD | write_atomic_from_stdin "$OUTFILE"; then
     log "OK: $OUTFILE"
     if [[ "$KEEP" == "true" ]]; then
       log "ZFS: snapshot behouden: $SNAPSHOT"
@@ -360,7 +326,6 @@ zfs_send_snapshot() {
     fail "zfs send mislukt"
   fi
 }
-# ==========================
 
 # ========= High-level acties =========
 snapshot_only() {
@@ -418,22 +383,19 @@ snapshot_delete() {
   [[ "$base" == /dev/*/* ]] && base="${base##*/}"
   if have_cmd lvs; then
     local p1="$base" p2="manualsnap-$base" p3="rootsnap-$base"
+    lvs --noheadings -o vg_name,lv_name,lv_attr | awk '{$1=$1};1' | \
     while read -r vg lv attr; do
       if [[ "$attr" =~ ^s ]] && [[ "$lv" == "$p1" || "$lv" == "$p2" || "$lv" == "$p3" ]]; then
         log "Verwijder LVM snapshot: ${vg}/${lv}"
-        lvremove -f "/dev/${vg}/${lv}" >>"$LOG_FILE" 2>&1 && ((deleted++)) || log "Waarschuwing: kon ${vg}/${lv} niet verwijderen"
+        if lvremove -f "/dev/${vg}/${lv}" >>"$LOG_FILE" 2>&1; then ((deleted++)); else log "Waarschuwing: kon ${vg}/${lv} niet verwijderen"; fi
       fi
-    done < <(lvs --noheadings -o vg_name,lv_name,lv_attr | awk '{$1=$1};1')
+    done
   fi
 
-  if (( deleted == 0 )); then
-    fail "Geen snapshot gevonden met naam '$name' (ZFS of LVM)."
-  else
-    log "Snapshot-delete: verwijderd=$deleted"
-  fi
+  (( deleted == 0 )) && fail "Geen snapshot gevonden met naam '$name' (ZFS of LVM)." || log "Snapshot-delete: verwijderd=$deleted"
 }
 
-# ========= NIEUW: full-disk -> sparse raw + xz =========
+# ========= Full-disk -> sparse raw + xz =========
 full_disk_backup() {
   local type="$1" outdir="$2"
   local rootdev pk base rawfile outfile
@@ -443,10 +405,9 @@ full_disk_backup() {
   base="${pk:+/dev/$pk}"; [[ -n "$base" ]] || base="$rootdev"
   [[ -b "$base" ]] || fail "Kon fysieke disk niet bepalen ($base)"
 
-  rawfile="${outdir}/${HOST}-disk-${type}-${TODAY}.img"      # tijdelijk raw (sparse)
-  outfile="${rawfile}.xz"                                    # eindresultaat
+  rawfile="${outdir}/${HOST}-disk-${type}-${TODAY}.img"
+  outfile="${rawfile}.xz"
 
-  # Optioneel: TRIM vooraf (kan compressie/sparseness helpen op SSD's)
   if command -v fstrim >/dev/null 2>&1; then
     log "TRIM: fstrim -av (pre-image)"
     fstrim -av >>"$LOG_FILE" 2>&1 || log "Waarschuwing: fstrim faalde; ga door"
@@ -511,14 +472,24 @@ create_backup() {
     full_disk_backup "$T" "$outdir"
   fi
 }
-# ==========================
 
 # ========= Retentie & Cleanup =========
+
+# helper: lijst files op mtime (nieuw->oud), zonder process substitution
+list_files_by_mtime() {
+  local dir="$1"
+  find "$dir" -maxdepth 1 -type f \( -name '*.gz' -o -name '*.xz' \) -printf '%T@ %p\n' 2>/dev/null \
+  | sort -nr | sed -E 's/^[0-9.]+ //'
+}
+
 prune_dir() {
   local dir="$1" keep="$2" files=()
-  # Tel zowel .gz als .xz (laatste eerst)
-  mapfile -t files < <(ls -1t "$dir"/*.gz "$dir"/*.xz 2>/dev/null || true)
+  local tmp; tmp="$(mktemp)"
+  list_files_by_mtime "$dir" > "$tmp"
+  mapfile -t files < "$tmp" || true
+  rm -f "$tmp" 2>/dev/null || true
   (( ${#files[@]} <= keep )) && return 0
+  local f
   for f in "${files[@]:$keep}"; do
     log "Retentie: verwijder $f"
     rm -f -- "$f" || log "Waarschuwing: kon $f niet verwijderen"
@@ -533,44 +504,47 @@ cleanup_archives() {
     find "$BASE_DIR" -type f -size 0 -print -delete 2>/dev/null || true
   fi
   if [[ "$CLEANUP_VALIDATE_ARCHIVES" == "true" && -n "$CHECKSUM_CMD" ]]; then
-    while IFS= read -r -d '' f; do
-      [[ "$CLEANUP_QUICK_ONLY" == "true" && -f "${f}.${CHECKSUM_EXT}" ]] && continue
-      if verify_checksum "$f"; then
-        : # ok
-      else
-        case $? in
-          1)
-            local ts base dest; ts="$(date +%s)"; base="$(basename "$f")"; dest="$QUARANTINE_DIR/${base}.bad.${ts}"
-            log "Checksum mismatch -> quarantine: $f -> $dest"
-            mkdir -p "$QUARANTINE_DIR" 2>/dev/null || true
-            mv -f -- "$f" "$dest" || log "Waarschuwing: kon $f niet verplaatsen"
-            [[ -f "${f}.${CHECKSUM_EXT}" ]] && mv -f -- "${f}.${CHECKSUM_EXT}" "${dest}.${CHECKSUM_EXT}" || true
-            ;;
-          2) : ;;
-        esac
-      fi
-    done < <(find "$BASE_DIR" -type f \( -name '*.gz' -o -name '*.xz' \) -print0 2>/dev/null)
+    find "$BASE_DIR" -type f \( -name '*.gz' -o -name '*.xz' \) -print0 2>/dev/null \
+    | while IFS= read -r -d '' f; do
+        [[ "$CLEANUP_QUICK_ONLY" == "true" && -f "${f}.${CHECKSUM_EXT}" ]] && continue
+        if verify_checksum "$f"; then
+          :
+        else
+          case $? in
+            1)
+              local ts base dest; ts="$(date +%s)"; base="$(basename "$f")"; dest="$QUARANTINE_DIR/${base}.bad.${ts}"
+              log "Checksum mismatch -> quarantine: $f -> $dest"
+              mkdir -p "$QUARANTINE_DIR" 2>/dev/null || true
+              mv -f -- "$f" "$dest" || log "Waarschuwing: kon $f niet verplaatsen"
+              [[ -f "${f}.${CHECKSUM_EXT}" ]] && mv -f -- "${f}.${CHECKSUM_EXT}" "${dest}.${CHECKSUM_EXT}" || true
+              ;;
+            2) : ;;
+          esac
+        fi
+      done
   fi
 }
 
 cleanup_stale_snapshots() {
   [[ "$CLEANUP_REMOVE_STALE_SNAPSHOTS" == "true" ]] || return 0
   if have_cmd lvs; then
+    lvs --noheadings -o vg_name,lv_name,lv_attr | awk '{$1=$1};1' | \
     while read -r vg lv attr; do
       if [[ "$attr" =~ ^s ]] && [[ "$lv" =~ ^rootsnap- ]]; then
         log "Cleanup: LVM stale snapshot ${vg}/${lv}"
         lvremove -f "/dev/${vg}/${lv}" >>"$LOG_FILE" 2>&1 || log "Waarschuwing: kon snapshot ${vg}/${lv} niet verwijderen"
       fi
-    done < <(lvs --noheadings -o vg_name,lv_name,lv_attr | awk '{$1=$1};1')
+    done
   fi
   if [[ "$ROOT_FSTYPE" == "zfs" ]] && have_cmd zfs; then
+    zfs list -H -t snapshot -o name 2>/dev/null | \
     while read -r snap; do
-      local base="${snap##*@}"
+      base="${snap##*@}"
       if [[ "$base" =~ ^(S|M|H)-[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
         log "Cleanup: ZFS stale snapshot $snap"
         zfs destroy "$snap" >>"$LOG_FILE" 2>&1 || log "Waarschuwing: kon snapshot $snap niet verwijderen"
       fi
-    done < <(zfs list -H -t snapshot -o name 2>/dev/null || true)
+    done
   fi
 }
 
@@ -579,18 +553,19 @@ cleanup_all() { cleanup_archives; cleanup_stale_snapshots; log "Cleanup: klaar";
 verify_archives() {
   [[ -n "$CHECKSUM_CMD" ]] || { log "Verify: geen checksumtool (b3sum/sha256sum)"; return 2; }
   local total=0 ok=0 bad=0 missing=0 created=0
-  while IFS= read -r -d '' f; do
-    ((total++))
-    if [[ ! -f "${f}.${CHECKSUM_EXT}" ]]; then
-      ((missing++))
-      [[ "$CHECKSUM_CREATE_IF_MISSING" == "true" ]] && { write_checksum "$f" || true; ((created++)); }
-    fi
-    if verify_checksum "$f"; then
-      ((ok++))
-    else
-      [[ $? -eq 1 ]] && ((bad++))
-    fi
-  done < <(find "$BASE_DIR" -type f \( -name '*.gz' -o -name '*.xz' \) -print0 2>/dev/null)
+  find "$BASE_DIR" -type f \( -name '*.gz' -o -name '*.xz' \) -print0 2>/dev/null \
+  | while IFS= read -r -d '' f; do
+      ((total++))
+      if [[ ! -f "${f}.${CHECKSUM_EXT}" ]]; then
+        ((missing++))
+        [[ "$CHECKSUM_CREATE_IF_MISSING" == "true" ]] && { write_checksum "$f" || true; ((created++)); }
+      fi
+      if verify_checksum "$f"; then
+        ((ok++))
+      else
+        [[ $? -eq 1 ]] && ((bad++))
+      fi
+    done
   log "Verify: total=$total ok=$ok mismatch=$bad missing=$missing created=$created"
   [[ $bad -eq 0 ]]
 }
@@ -602,14 +577,12 @@ self_test() {
   [[ -w "$BASE_DIR" ]] || fail "BASE_DIR niet schrijfbaar: $BASE_DIR"
   for d in "$W_DIR" "$M_DIR" "$H_DIR" "$MANUAL_DIR"; do mkdir -p "$d"; [[ -w "$d" ]] || fail "Doelmap niet schrijfbaar: $d"; done
 
-  # Tools (na auto-install)
   for bin in findmnt lsblk dd; do have_cmd "$bin" || fail "Benodigde tool ontbreekt: $bin"; done
   have_cmd "$COMP" || fail "Compressor ontbreekt: $COMP"
   have_cmd lvs || log "Let op: lvm2 tooling (lvs) niet gevonden; LVM-functionaliteit beperkt"
   have_cmd zfs || true
   have_cmd xz  && log "xz aanwezig" || log "xz ontbreekt (full-disk fallback gebruikt compressor $COMP)"
 
-  # partclone info
   have_cmd partclone.extfs && log "partclone.extfs aanwezig"
   have_cmd partclone.xfs  && log "partclone.xfs aanwezig"
 
@@ -620,9 +593,7 @@ self_test() {
   tfile="${tdir}/.selftest-${NOWHM}"
   echo "hello-selftest" | write_atomic_from_stdin "$tfile"
   [[ -s "$tfile" ]] || fail "Atomisch wegschrijven faalde ($tfile niet aangemaakt)"
-  if [[ -n "$CHECKSUM_CMD" ]]; then
-    verify_checksum "$tfile" || true
-  fi
+  [[ -n "$CHECKSUM_CMD" ]] && verify_checksum "$tfile" || true
   rm -f -- "$tfile" "${tfile}.b3" "${tfile}.sha256" 2>/dev/null || true
 
   [[ -n "$ROOT_FSTYPE" ]] || fail "Kon root FSTYPE niet bepalen"
@@ -653,7 +624,6 @@ self_test() {
 
   log "=== Self-test geslaagd ==="
 }
-# ==========================
 
 # ========= CLI parsing =========
 FORCE_TYPE=""            # S|M|H
@@ -667,6 +637,7 @@ SNAPSHOT_NAME_OVERRIDE=""
 
 while (("$#")); do
   case "$1" in
+    -h|--help) SHOW_HELP=true ;;
     --force)
       shift; [[ $# -gt 0 ]] || fail "--force vereist waarde (S|M|H|weekly|monthly|semiannual)"
       case "$1" in
@@ -689,7 +660,12 @@ while (("$#")); do
   esac
   shift
 done
-# ==============================
+
+# Help eerst tonen en stoppen (geen lock aanmaken)
+if $SHOW_HELP; then
+  print_help
+  exit 0
+fi
 
 # ========= Init/run =========
 [[ -f "$LOCK_FILE" ]] && fail "Lock bestaat al ($LOCK_FILE). Draait er al een job?"
@@ -699,7 +675,6 @@ mkdir -p "$W_DIR" "$M_DIR" "$H_DIR" "$MANUAL_DIR"
 [[ "$CLEANUP_QUARANTINE_CORRUPT" == "true" ]] && mkdir -p "$QUARANTINE_DIR"
 test -w "$BASE_DIR" || fail "BASE_DIR ($BASE_DIR) is niet schrijfbaar"
 
-# Zorg eerst voor tools (auto-install indien mogelijk), daarna init compressor/checksum
 ensure_tools
 COMP="$(compressor)"
 init_checksum
@@ -709,11 +684,6 @@ if [[ -n "$SNAPSHOT_DELETE_NAME" ]]; then
   log "=== Snapshot-delete gestart $TODAY ==="
   snapshot_delete "$SNAPSHOT_DELETE_NAME"
   log "=== Snapshot-delete klaar ==="
-  exit 0
-fi
-
-if $SHOW_HELP; then
-  print_help
   exit 0
 fi
 
@@ -728,7 +698,7 @@ fi
 
 if $VERIFY_ONLY; then
   log "=== Verify gestart $TODAY ==="
-  verify_archives && { log "=== Verify OK ==="; exit 0; } || { log "=== Verify: mismatches ==="; exit 1; }
+  if verify_archives; then log "=== Verify OK ==="; exit 0; else log "=== Verify: mismatches ==="; exit 1; fi
 fi
 
 if $SNAPSHOT_ONLY; then
