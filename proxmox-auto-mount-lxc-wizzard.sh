@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ============================================
-# TrueNAS NFS mount setup voor Proxmox LXC's (Host-wizard, interactief)
+# TrueNAS NFS mount setup voor Proxmox LXC's (Host-wizard, interactief, met menu)
 # ============================================
 
 # ---- Defaults (kun je via env overschrijven vóór start) ----
@@ -26,6 +26,26 @@ ask_default() {
   local q="$1" def="$2" ans=""
   read -r -p "$q [$def]: " ans || true
   echo "${ans:-$def}"
+}
+
+# -------- fzf (multi-select) installer --------
+ensure_fzf() {
+  if have fzf; then return 0; fi
+  log "fzf niet gevonden; probeer te installeren…"
+  local SUDO=""; (( EUID != 0 )) && have sudo && SUDO="sudo"
+  if have apt-get; then
+    $SUDO apt-get update -y || true
+    $SUDO apt-get install -y fzf || true
+  elif have dnf; then
+    $SUDO dnf install -y fzf || true
+  elif have yum; then
+    $SUDO yum install -y fzf || true
+  elif have zypper; then
+    $SUDO zypper --non-interactive install fzf || true
+  elif have pacman; then
+    $SUDO pacman -Sy --noconfirm fzf || true
+  fi
+  have fzf || log "Kon fzf niet installeren; val terug op numeriek menu."
 }
 
 # -------- Lokale (binnen huidige machine) installatie ----------
@@ -67,8 +87,11 @@ configure_local(){
 }
 
 # --------- Host: LXC info helpers ----------
+pct_list_ct_raw(){ pct list 2>/dev/null || true; }
+
 pct_list_ctids(){
-  pct list | awk 'NR>1{print $1}'
+  # Pakt alleen een numerieke eerste kolom (VMID), slaat header/lege regels over
+  pct_list_ct_raw | awk 'NR>1 && $1 ~ /^[0-9]+$/ {print $1}'
 }
 
 ct_status(){
@@ -76,20 +99,21 @@ ct_status(){
   pct status "$id" 2>/dev/null | awk '{print $2}'
 }
 
-ct_hostname(){
+ct_name_from_list(){
+  # Snelle naam uit `pct list` (3e kolom)
   local id="$1"
-  # Probeer uit config; valt terug op pct list-naam als nodig
-  local hn
+  pct_list_ct_raw | awk -v id="$id" 'NR>1 && $1==id {print $3; exit}'
+}
+
+ct_hostname(){
+  local id="$1" hn=""
   hn="$(pct config "$id" 2>/dev/null | awk -F': ' '/^hostname:/{print $2; found=1} END{if(!found)print""}')" || true
-  if [[ -z "$hn" ]]; then
-    hn="$(pct list | awk -v id="$id" 'NR>1 && $1==id{print $3; exit}')" || true
-  fi
+  [[ -n "$hn" ]] || hn="$(ct_name_from_list "$id" || true)"
   echo "${hn:-unknown}"
 }
 
 ct_mountable_now(){
   local id="$1"
-  # mountable als features mount=nfs of nfs=1 in config
   if pct config "$id" 2>/dev/null | grep -Eq '^features:.*(mount=nfs|nfs=1)'; then
     echo "yes"
   else
@@ -97,11 +121,7 @@ ct_mountable_now(){
   fi
 }
 
-# --------- Host: LXC selectie & configuratie ----------
-pct_is_running(){
-  local id="$1"
-  [[ "$(ct_status "$id")" == "running" ]]
-}
+pct_is_running(){ [[ "$(ct_status "$1")" == "running" ]]; }
 
 pct_ensure_running(){
   local id="$1"
@@ -122,14 +142,11 @@ pct_try_enable_nfs_feature(){
   if pct set "$id" -features mount=nfs >/dev/null 2>&1; then
     log "CT $id: NFS feature gezet. (Herstart kan nodig zijn)"
   else
-    log "CT $id: Kon NFS feature niet automatisch zetten. Controleer handmatig in /etc/pve/lxc/${id}.conf (features: mount=nfs)."
+    log "CT $id: Kon NFS feature niet automatisch zetten. Check /etc/pve/lxc/${id}.conf (features: mount=nfs)."
   fi
 }
 
-pct_exec(){
-  local id="$1"; shift
-  pct exec "$id" -- bash -lc "$*"
-}
+pct_exec(){ local id="$1"; shift; pct exec "$id" -- bash -lc "$*"; }
 
 setup_in_ct(){
   local id="$1"
@@ -139,156 +156,4 @@ setup_in_ct(){
   pct_try_enable_nfs_feature "$id"
 
   if ! pct_exec "$id" 'command -v apt >/dev/null'; then
-    log "CT $id: apt niet gevonden; sla over."
-    return 1
-  fi
-
-  log "CT $id: nfs-common installeren"
-  pct_exec "$id" 'export DEBIAN_FRONTEND=noninteractive; apt -y update && apt -y install nfs-common' || {
-    log "CT $id: installatie nfs-common faalde"; return 1; }
-
-  log "CT $id: mountpoint aanmaken: '"$MOUNTPOINT"'"
-  pct_exec "$id" "mkdir -p '$MOUNTPOINT'"
-
-  local FSTAB_LINE="${NAS_HOST}:${REMOTE_PATH}  ${MOUNTPOINT}  nfs  ${FSTAB_OPTS}  0  0"
-
-  log "CT $id: /etc/fstab bijwerken"
-  pct_exec "$id" "sed -i '\|[[:space:]]${MOUNTPOINT}[[:space:]]\\+nfs[[:space:]]|d' /etc/fstab || true"
-  pct_exec "$id" "printf '%s\n' \"$FSTAB_LINE\" >> /etc/fstab"
-
-  log "CT $id: systemd daemon-reload + wait-online (best effort)"
-  pct_exec "$id" 'systemctl daemon-reload || true'
-  pct_exec "$id" 'systemctl enable --now systemd-networkd-wait-online.service 2>/dev/null || true'
-  pct_exec "$id" 'systemctl enable --now NetworkManager-wait-online.service 2>/dev/null || true'
-
-  log "CT $id: mounten proberen (nfs4 direct, dan remote-fs.target)"
-  if ! pct_exec "$id" "mount -t nfs4 '${NAS_HOST}:${REMOTE_PATH}' '${MOUNTPOINT}'"; then
-    pct_exec "$id" "systemctl restart remote-fs.target" || true
-  fi
-
-  log "=== CT $id: configuratie klaar ==="
-}
-
-# --------- Nieuwe multi-select met status/mountable ----------
-select_cts(){
-  # Bouw info
-  local ids=() lines=()
-  while IFS= read -r id; do
-    [[ -n "$id" ]] || continue
-    ids+=("$id")
-    local st hn mnt mark
-    st="$(ct_status "$id")"
-    hn="$(ct_hostname "$id")"
-    mnt="$(ct_mountable_now "$id")"
-    [[ "$mnt" == "yes" ]] && mark="✓" || mark="✗"
-    # Vorm: "<id>  [✓/✗] name | status:<running/stopped> | nfs:<yes/no>"
-    lines+=("$(printf "%-5s [%-1s] %-24s | status:%-8s | nfs:%s" "$id" "$mark" "$hn" "${st:-unknown}" "$mnt")")
-  done < <(pct_list_ctids)
-
-  (( ${#ids[@]} )) || fail "Geen LXC containers gevonden (pct list)."
-
-  # fzf multi-select als aanwezig
-  if have fzf; then
-    # Toon keurige lijst; user selecteert met spatie, Enter bevestigt
-    local selected
-    selected="$(printf "%s\n" "${lines[@]}" \
-      | fzf -m \
-            --prompt="Selecteer CT's > " \
-            --header="Spatie=selecteer, Enter=bevestig | [✓]=mountable nu, [✗]=nu niet (wizard probeert te activeren)" \
-            --height=90% --border --ansi \
-            --preview 'echo {}' --preview-window=down,10%)" || true
-    [[ -n "$selected" ]] || fail "Geen selectie gemaakt."
-    # Pak eerste veld = CTID
-    printf "%s\n" "$selected" | awk '{print $1}'
-    return 0
-  fi
-
-  # Anders: numeriek menu (multi-keuze)
-  >&2 echo
-  >&2 echo "Beschikbare LXC's:"
-  local i=1
-  for line in "${lines[@]}"; do
-    >&2 printf "  [%2d] %s\n" "$i" "$line"
-    ((i++))
-  done
-  >&2 echo
-  >&2 echo "Kies één of meerdere met nummers of CTIDs, gescheiden door spaties. Of typ 'all'."
-  local sel; read -r -p "Keuze: " sel
-
-  if [[ "$sel" == "all" ]]; then
-    printf "%s\n" "${ids[@]}"
-    return 0
-  fi
-
-  # Parse tokens: nummer -> map naar id; CTID -> valideren
-  local chosen=()
-  for tok in $sel; do
-    if [[ "$tok" =~ ^[0-9]+$ ]]; then
-      # nummer of CTID? Als binnen menu-range, map naar id; anders check of het CTID is
-      if (( tok>=1 && tok< i )); then
-        chosen+=("${ids[tok-1]}")
-      else
-        # misschien is het direct een CTID
-        if printf "%s\n" "${ids[@]}" | grep -qx "$tok"; then
-          chosen+=("$tok")
-        else
-          >&2 echo "  - Onbekende keuze: $tok (genegeerd)"
-        fi
-      fi
-    else
-      >&2 echo "  - Ongeldig token: $tok (genegeerd)"
-    fi
-  done
-  (( ${#chosen[@]} )) || fail "Geen geldige keuze."
-  printf "%s\n" "${chosen[@]}"
-}
-
-main(){
-  echo "== TrueNAS NFS mount setup (Host-wizard) =="
-
-  # ---- Interactieve prompts met defaults ----
-  NAS_HOST="$(ask_default "NAS host/IP" "$NAS_HOST")"
-  REMOTE_PATH="$(ask_default "Remote export (pad op NAS)" "$REMOTE_PATH")"
-  MOUNTPOINT="$(ask_default "Mountpoint in container" "$MOUNTPOINT")"
-
-  echo
-  echo "Samenvatting:"
-  echo "  NAS_HOST   = ${NAS_HOST}"
-  echo "  REMOTE_PATH= ${REMOTE_PATH}"
-  echo "  MOUNTPOINT = ${MOUNTPOINT}"
-  read -r -p "Kloppen deze waarden? [Y/n] " yn
-  [[ "${yn:-Y}" =~ ^([Yy]|)$ ]] || fail "Afgebroken."
-
-  log "NAS=${NAS_HOST} EXPORT=${REMOTE_PATH} MOUNTPOINT=${MOUNTPOINT}"
-
-  if on_host; then
-    need_root
-    echo
-    echo "Host-modus gedetecteerd (pct gevonden). We gaan containers configureren."
-    echo "Let op: [✓] = mountable nu (features: mount=nfs), [✗] = nu niet; de wizard probeert dit zo nodig te activeren."
-    echo
-
-    mapfile -t targets < <(select_cts)
-
-    echo
-    echo "Gekozen CTIDs: ${targets[*]}"
-    read -r -p "Doorgaan met configuratie? [Y/n] " go
-    [[ "${go:-Y}" =~ ^([Yy]|)$ ]] || fail "Afgebroken."
-
-    for id in "${targets[@]}"; do
-      setup_in_ct "$id" || log "CT $id: er trad een fout op (zie log)."
-    done
-
-    echo
-    log "Alle gekozen containers zijn verwerkt."
-    echo "Controlevoorbeeld: pct exec <CTID> -- bash -lc 'mount | grep ${MOUNTPOINT}'"
-  else
-    echo
-    echo "Geen 'pct' gevonden: aannemend dat je binnen een LXC draait."
-    read -r -p "Deze container nu configureren? [Y/n] " yn2
-    [[ "${yn2:-Y}" =~ ^([Yy]|)$ ]] || fail "Afgebroken."
-    configure_local
-  fi
-}
-
-main "$@"
+    log "CT
