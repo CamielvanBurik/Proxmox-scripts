@@ -422,8 +422,8 @@ full_disk_backup() {
   fi
 
   if command -v xz >/dev/null 2>&1; then
-    log "Compress (xz --threads=0 --sparse): $rawfile -> $outfile"
-    if xz --threads=0 --sparse -c "$rawfile" | write_atomic_from_stdin "$outfile"; then
+    log "Compress (xz --threads=0): $rawfile -> $outfile"
+    if xz --threads=0 -c "$rawfile" | write_atomic_from_stdin "$outfile"; then
       rm -f -- "$rawfile" 2>/dev/null || true
       log "OK: $outfile"
     else
