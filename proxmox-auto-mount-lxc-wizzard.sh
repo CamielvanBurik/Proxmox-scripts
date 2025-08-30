@@ -15,6 +15,9 @@ FSTAB_OPTS="${FSTAB_OPTS:-vers=4.1,proto=tcp,_netdev,bg,noatime,timeo=150,retran
 
 LOG_FILE="${LOG_FILE:-/var/log/truenas-nfs-lxc-setup.log}"
 
+# CLI toggles
+NO_FZF=false
+
 # -----------------------------------------------
 log(){ echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"; }
 fail(){ log "ERROR: $*"; exit 1; }
@@ -22,30 +25,65 @@ have(){ command -v "$1" >/dev/null 2>&1; }
 need_root(){ [[ $EUID -eq 0 ]] || fail "Root is vereist."; }
 on_host(){ have pct; }
 
+usage(){
+  cat <<EOF
+Gebruik: $(basename "$0") [opties]
+
+Opties:
+  --no-fzf     Forceer numeriek menu (geen fzf)
+  -h, --help   Toon deze hulp en stop
+
+Interactieve prompts vragen NAS host, exportpad en mountpoint.
+Op de host kun je meerdere LXC's selecteren via fzf (indien beschikbaar) of via een numeriek menu.
+EOF
+}
+
+# ---- parse args
+while (("$#")); do
+  case "$1" in
+    --no-fzf) NO_FZF=true ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Onbekende optie: $1"; usage; exit 1 ;;
+  esac
+  shift
+done
+
 ask_default() {
   local q="$1" def="$2" ans=""
   read -r -p "$q [$def]: " ans || true
   echo "${ans:-$def}"
 }
 
-# -------- fzf (multi-select) installer --------
+# -------- fzf (multi-select) installer / beslisser --------
 ensure_fzf() {
+  # Gebruik fzf alleen als we op een TTY zitten en de gebruiker het niet heeft uitgezet
+  [[ -t 1 ]] || return 1
+  [[ "$NO_FZF" == "true" ]] && return 1
   if have fzf; then return 0; fi
+
   log "fzf niet gevonden; probeer te installeren…"
   local SUDO=""; (( EUID != 0 )) && have sudo && SUDO="sudo"
+
   if have apt-get; then
-    $SUDO apt-get update -y || true
-    $SUDO apt-get install -y fzf || true
+    env DEBIAN_FRONTEND=noninteractive $SUDO apt-get -y update || true
+    env DEBIAN_FRONTEND=noninteractive $SUDO apt-get -y install fzf || true
   elif have dnf; then
-    $SUDO dnf install -y fzf || true
+    $SUDO dnf -y install fzf || true
   elif have yum; then
-    $SUDO yum install -y fzf || true
+    $SUDO yum -y install fzf || true
   elif have zypper; then
     $SUDO zypper --non-interactive install fzf || true
   elif have pacman; then
     $SUDO pacman -Sy --noconfirm fzf || true
   fi
-  have fzf || log "Kon fzf niet installeren; val terug op numeriek menu."
+
+  if have fzf; then
+    log "fzf geïnstalleerd."
+    return 0
+  else
+    log "Kon fzf niet installeren; val terug op numeriek menu."
+    return 1
+  fi
 }
 
 # -------- Lokale (binnen huidige machine) installatie ----------
@@ -90,7 +128,6 @@ configure_local(){
 pct_list_ct_raw(){ pct list 2>/dev/null || true; }
 
 pct_list_ctids(){
-  # Pakt alleen een numerieke eerste kolom (VMID), slaat header/lege regels over
   pct_list_ct_raw | awk 'NR>1 && $1 ~ /^[0-9]+$/ {print $1}'
 }
 
@@ -100,7 +137,6 @@ ct_status(){
 }
 
 ct_name_from_list(){
-  # Snelle naam uit `pct list` (3e kolom)
   local id="$1"
   pct_list_ct_raw | awk -v id="$id" 'NR>1 && $1==id {print $3; exit}'
 }
@@ -188,22 +224,24 @@ setup_in_ct(){
 
 # --------- Multi-select menu ----------
 select_cts(){
-  # Verzamel info
+  log "Containers ophalen…"
   local ids=() lines=()
   while IFS= read -r id; do
     [[ -n "$id" ]] || continue
     ids+=("$id")
     local st hn mnt mark
-    st="$(ct_status "$id")"; hn="$(ct_hostname "$id")"; mnt="$(ct_mountable_now "$id")"
+    st="$(ct_status "$id" 2>/dev/null || true)"
+    hn="$(ct_hostname "$id" 2>/dev/null || true)"
+    mnt="$(ct_mountable_now "$id" 2>/dev/null || echo no)"
     [[ "$mnt" == "yes" ]] && mark="✓" || mark="✗"
-    lines+=("$(printf "%-6s [%-1s] %-24s | status:%-8s | nfs:%s" "$id" "$mark" "$hn" "${st:-unknown}" "$mnt")")
+    lines+=("$(printf "%-6s [%-1s] %-24s | status:%-8s | nfs:%s" "$id" "$mark" "${hn:-unknown}" "${st:-unknown}" "$mnt")")
   done < <(pct_list_ctids)
 
   (( ${#ids[@]} )) || fail "Geen LXC containers gevonden (pct list)."
+  log "Gevonden: ${#ids[@]} container(s)."
 
-  # Probeer fzf, anders numeriek menu
-  ensure_fzf
-  if have fzf; then
+  if ensure_fzf; then
+    log "fzf-menu openen… (spatie=selecteren, Enter=bevestigen, ESC=annuleren)"
     local selected
     selected="$(printf "%s\n" "${lines[@]}" \
       | fzf -m \
@@ -211,9 +249,12 @@ select_cts(){
             --header="Spatie=selecteer, Enter=bevestig | [✓]=mountable nu, [✗]=nu niet (wizard probeert te activeren)" \
             --height=90% --border --ansi \
             --preview 'echo {}' --preview-window=down,10%)" || true
-    [[ -n "$selected" ]] || fail "Geen selectie gemaakt."
-    printf "%s\n" "$selected" | awk '{print $1}'
-    return 0
+    if [[ -n "$selected" ]]; then
+      printf "%s\n" "$selected" | awk '{print $1}'
+      return 0
+    else
+      log "Geen keuze via fzf; val terug op numeriek menu."
+    fi
   fi
 
   # Numeriek fallback (multi)
@@ -272,6 +313,7 @@ main(){
     echo "Let op: [✓] = mountable nu (features: mount=nfs), [✗] = nu niet; de wizard probeert dit zo nodig te activeren."
     echo
 
+    log "Start selectie-menu…"
     mapfile -t targets < <(select_cts)
 
     echo
