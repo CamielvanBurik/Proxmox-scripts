@@ -3,8 +3,6 @@ set -euo pipefail
 
 # ============================================
 # TrueNAS NFS mount setup voor Proxmox LXC's (Host-wizard, interactief)
-# - Draai op de Proxmox host (met 'pct') om meerdere LXC's te configureren
-# - Draai binnen een LXC om alleen die container te configureren (valt terug op lokale setup)
 # ============================================
 
 # ---- Defaults (kun je via env overschrijven vóór start) ----
@@ -68,14 +66,41 @@ configure_local(){
   log "Klaar. Controle: 'mount | grep ${MOUNTPOINT}'"
 }
 
-# --------- Host: LXC selectie & configuratie ----------
+# --------- Host: LXC info helpers ----------
 pct_list_ctids(){
   pct list | awk 'NR>1{print $1}'
 }
 
+ct_status(){
+  local id="$1"
+  pct status "$id" 2>/dev/null | awk '{print $2}'
+}
+
+ct_hostname(){
+  local id="$1"
+  # Probeer uit config; valt terug op pct list-naam als nodig
+  local hn
+  hn="$(pct config "$id" 2>/dev/null | awk -F': ' '/^hostname:/{print $2; found=1} END{if(!found)print""}')" || true
+  if [[ -z "$hn" ]]; then
+    hn="$(pct list | awk -v id="$id" 'NR>1 && $1==id{print $3; exit}')" || true
+  fi
+  echo "${hn:-unknown}"
+}
+
+ct_mountable_now(){
+  local id="$1"
+  # mountable als features mount=nfs of nfs=1 in config
+  if pct config "$id" 2>/dev/null | grep -Eq '^features:.*(mount=nfs|nfs=1)'; then
+    echo "yes"
+  else
+    echo "no"
+  fi
+}
+
+# --------- Host: LXC selectie & configuratie ----------
 pct_is_running(){
   local id="$1"
-  [[ "$(pct status "$id" | awk '{print $2}')" == "running" ]]
+  [[ "$(ct_status "$id")" == "running" ]]
 }
 
 pct_ensure_running(){
@@ -89,18 +114,15 @@ pct_ensure_running(){
 
 pct_try_enable_nfs_feature(){
   local id="$1"
-  local cfg="/etc/pve/lxc/${id}.conf"
-  if [[ -r "$cfg" ]]; then
-    if grep -Eq '(^|\s)features:\s*.*(mount=nfs|nfs=1).*' "$cfg"; then
-      log "CT $id: NFS feature al aanwezig."
-      return 0
-    fi
+  if [[ "$(ct_mountable_now "$id")" == "yes" ]]; then
+    log "CT $id: NFS feature al aanwezig."
+    return 0
   fi
   log "CT $id: probeer NFS feature te activeren (pct set -features mount=nfs)…"
   if pct set "$id" -features mount=nfs >/dev/null 2>&1; then
     log "CT $id: NFS feature gezet. (Herstart kan nodig zijn)"
   else
-    log "CT $id: Kon NFS feature niet automatisch zetten. Controleer handmatig in ${cfg} (features: mount=nfs)."
+    log "CT $id: Kon NFS feature niet automatisch zetten. Controleer handmatig in /etc/pve/lxc/${id}.conf (features: mount=nfs)."
   fi
 }
 
@@ -147,38 +169,77 @@ setup_in_ct(){
   log "=== CT $id: configuratie klaar ==="
 }
 
+# --------- Nieuwe multi-select met status/mountable ----------
 select_cts(){
-  local tmp="$(mktemp)"
-  pct_list_ctids > "$tmp"
-  local all_cts=()
-  while IFS= read -r c; do [[ -n "$c" ]] && all_cts+=("$c"); done < "$tmp"
-  rm -f "$tmp"
+  # Bouw info
+  local ids=() lines=()
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    ids+=("$id")
+    local st hn mnt mark
+    st="$(ct_status "$id")"
+    hn="$(ct_hostname "$id")"
+    mnt="$(ct_mountable_now "$id")"
+    [[ "$mnt" == "yes" ]] && mark="✓" || mark="✗"
+    # Vorm: "<id>  [✓/✗] name | status:<running/stopped> | nfs:<yes/no>"
+    lines+=("$(printf "%-5s [%-1s] %-24s | status:%-8s | nfs:%s" "$id" "$mark" "$hn" "${st:-unknown}" "$mnt")")
+  done < <(pct_list_ctids)
 
-  (( ${#all_cts[@]} )) || fail "Geen LXC containers gevonden (pct list)."
+  (( ${#ids[@]} )) || fail "Geen LXC containers gevonden (pct list)."
 
-  echo
-  echo "Beschikbare LXC CTIDs:"
-  pct list
-
-  echo
-  echo "Kies CTID(s) gescheiden door spaties, of 'all' voor allemaal."
-  local sel; read -r -p "CTIDs: " sel
-
-  if [[ "$sel" == "all" ]]; then
-    printf "%s\n" "${all_cts[@]}"
+  # fzf multi-select als aanwezig
+  if have fzf; then
+    # Toon keurige lijst; user selecteert met spatie, Enter bevestigt
+    local selected
+    selected="$(printf "%s\n" "${lines[@]}" \
+      | fzf -m \
+            --prompt="Selecteer CT's > " \
+            --header="Spatie=selecteer, Enter=bevestig | [✓]=mountable nu, [✗]=nu niet (wizard probeert te activeren)" \
+            --height=90% --border --ansi \
+            --preview 'echo {}' --preview-window=down,10%)" || true
+    [[ -n "$selected" ]] || fail "Geen selectie gemaakt."
+    # Pak eerste veld = CTID
+    printf "%s\n" "$selected" | awk '{print $1}'
     return 0
   fi
 
+  # Anders: numeriek menu (multi-keuze)
+  >&2 echo
+  >&2 echo "Beschikbare LXC's:"
+  local i=1
+  for line in "${lines[@]}"; do
+    >&2 printf "  [%2d] %s\n" "$i" "$line"
+    ((i++))
+  done
+  >&2 echo
+  >&2 echo "Kies één of meerdere met nummers of CTIDs, gescheiden door spaties. Of typ 'all'."
+  local sel; read -r -p "Keuze: " sel
+
+  if [[ "$sel" == "all" ]]; then
+    printf "%s\n" "${ids[@]}"
+    return 0
+  fi
+
+  # Parse tokens: nummer -> map naar id; CTID -> valideren
   local chosen=()
-  for x in $sel; do
-    [[ "$x" =~ ^[0-9]+$ ]] || { echo "Ongeldige CTID: $x"; continue; }
-    if printf "%s\n" "${all_cts[@]}" | grep -qx "$x"; then
-      chosen+=("$x")
+  for tok in $sel; do
+    if [[ "$tok" =~ ^[0-9]+$ ]]; then
+      # nummer of CTID? Als binnen menu-range, map naar id; anders check of het CTID is
+      if (( tok>=1 && tok< i )); then
+        chosen+=("${ids[tok-1]}")
+      else
+        # misschien is het direct een CTID
+        if printf "%s\n" "${ids[@]}" | grep -qx "$tok"; then
+          chosen+=("$tok")
+        else
+          >&2 echo "  - Onbekende keuze: $tok (genegeerd)"
+        fi
+      fi
     else
-      echo "CTID niet gevonden: $x"
+      >&2 echo "  - Ongeldig token: $tok (genegeerd)"
     fi
   done
-  (( ${#chosen[@]} )) || fail "Geen geldige CTIDs gekozen."
+  (( ${#chosen[@]} )) || fail "Geen geldige keuze."
   printf "%s\n" "${chosen[@]}"
 }
 
@@ -204,7 +265,8 @@ main(){
     need_root
     echo
     echo "Host-modus gedetecteerd (pct gevonden). We gaan containers configureren."
-    echo "Let op: containers moeten NFS mogen mounten (feature 'mount=nfs')."
+    echo "Let op: [✓] = mountable nu (features: mount=nfs), [✗] = nu niet; de wizard probeert dit zo nodig te activeren."
+    echo
 
     mapfile -t targets < <(select_cts)
 
