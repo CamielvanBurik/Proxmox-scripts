@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =========================================================
-# Proxmox Scripts Runner (GitHub launcher)
+# Proxmox Scripts Runner (GitHub launcher) + fzf auto-install
 # =========================================================
 
 REPO_URL="${REPO_URL:-https://github.com/CamielvanBurik/Proxmox-scripts}"
@@ -43,11 +43,49 @@ done
 
 ensure_dir(){ mkdir -p "$1"; }
 
+# ---- fzf auto-install ----
+ensure_fzf() {
+  if have fzf; then return 0; fi
+  log "fzf niet gevonden; probeer te installeren…"
+
+  local SUDO=""
+  if (( EUID != 0 )) && have sudo; then SUDO="sudo"; fi
+
+  if have apt-get; then
+    $SUDO apt-get update -y || true
+    $SUDO apt-get install -y fzf || true
+  elif have dnf; then
+    $SUDO dnf install -y fzf || true
+  elif have yum; then
+    $SUDO yum install -y fzf || true
+  elif have zypper; then
+    $SUDO zypper --non-interactive install fzf || true
+  elif have pacman; then
+    $SUDO pacman -Sy --noconfirm fzf || true
+  else
+    log "Geen ondersteunde package manager gevonden; installeer fzf handmatig a.u.b."
+  fi
+
+  if have fzf; then
+    log "fzf succesvol geïnstalleerd."
+  else
+    log "Kon fzf niet installeren; val terug op numeriek menu."
+  fi
+}
+
 clone_or_update_git() {
   if [[ -d "$REPO_DIR/.git" ]]; then
-    log "Git repo gevonden, pull…"
+    log "Git repo gevonden, forceer sync naar laatste origin/HEAD…"
     git -C "$REPO_DIR" fetch --all --prune
-    git -C "$REPO_DIR" reset --hard origin/HEAD || git -C "$REPO_DIR" pull --ff-only
+    # Schakel naar remote default branch en synchroniseer hard + clean
+    # (val terug op pull als origin/HEAD niet bestaat).
+    if git -C "$REPO_DIR" rev-parse --abbrev-ref origin/HEAD >/dev/null 2>&1; then
+      git -C "$REPO_DIR" reset --hard origin/HEAD
+      git -C "$REPO_DIR" clean -fdx
+    else
+      git -C "$REPO_DIR" pull --ff-only || true
+      git -C "$REPO_DIR" clean -fdx || true
+    fi
   else
     log "Git clone -> $REPO_DIR"
     rm -rf "$REPO_DIR" 2>/dev/null || true
@@ -80,21 +118,13 @@ download_zip_branch() {
 sync_repo() {
   ensure_dir "$CACHE_DIR"
   if have git; then
-    if $FORCE_UPDATE || [[ ! -d "$REPO_DIR" ]]; then
-      clone_or_update_git
-    else
-      if [[ -d "$REPO_DIR/.git" ]]; then
-        log "Update (git pull) …"
-        git -C "$REPO_DIR" pull --ff-only || true
-      fi
-    fi
+    # Altijd syncen naar laatste versie
+    clone_or_update_git
   else
-    log "git niet gevonden; val terug op curl+unzip"
+    log "git niet gevonden; val terug op curl+unzip (altijd vers ophalen)"
     have curl || { echo "curl ontbreekt"; exit 1; }
     have unzip || { echo "unzip ontbreekt"; exit 1; }
-    if $FORCE_UPDATE || [[ ! -d "$REPO_DIR" ]]; then
-      download_zip_branch || { echo "Zip download mislukt"; exit 1; }
-    fi
+    download_zip_branch || { echo "Zip download mislukt"; exit 1; }
   fi
 }
 
@@ -106,13 +136,11 @@ find_scripts() {
 }
 
 menu_choose() {
-  # Let op: alles wat hier naar stdout gaat, wordt gevangen door command substitution.
-  # Daarom printen we het menu naar stderr (>&2) en alleen de uiteindelijke keuze naar stdout.
+  # Menu naar stderr; alleen de uiteindelijke keuze naar stdout.
   local -a items=("$@")
   (( ${#items[@]} )) || { echo ""; return 1; }
 
   if have fzf; then
-    # fzf schrijft de keuze naar stdout; preview etc. naar stderr.
     fzf --prompt="Selecteer script > " \
         --preview 'sed -n "1,120p" {}' \
         --preview-window=down,60%:wrap \
@@ -121,18 +149,15 @@ menu_choose() {
     >&2 echo "Geen fzf gevonden. Numeriek menu:"
     local i=1
     for f in "${items[@]}"; do
-      # toon relatieve paden
       >&2 printf "  [%2d] %s\n" "$i" "${f#$REPO_DIR/}"
       ((i++))
     done
     local sel
     while true; do
-      # read -p print sowieso naar stderr; dat is prima hier
       read -r -p "Nummer (1-$((i-1))): " sel
       [[ "$sel" =~ ^[0-9]+$ ]] && (( sel>=1 && sel<i )) && break
       >&2 echo "Ongeldige keuze."
     done
-    # Alleen de keuze naar stdout:
     echo "${items[sel-1]}"
   fi
 }
@@ -216,6 +241,7 @@ run_selected() {
 main() {
   ensure_dir "$CACHE_DIR"
   sync_repo
+  ensure_fzf
 
   mapfile -t scripts < <(find_scripts)
   (( ${#scripts[@]} )) || { echo "Geen scripts gevonden in $REPO_URL"; exit 1; }
