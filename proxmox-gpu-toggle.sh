@@ -83,32 +83,39 @@ yn(){
 }
 
 # ---------- hardened helpers (nounset-safe) ----------
+
+normalize_slot(){ local s="$1"; [[ "$s" =~ ^0000: ]] && echo "$s" || echo "0000:${s}"; }
+
 pci_path(){
   local slot="${1:-}"
-  [[ -n "$slot" ]] || { echo "/sys/bus/pci/devices/"; return 0; }
-  echo "/sys/bus/pci/devices/${slot#0000:}"
+  [[ -n "$slot" ]] || { echo "/sys/bus/pci/devices"; return 0; }
+  slot="$(normalize_slot "$slot")"
+  echo "/sys/bus/pci/devices/${slot}"
 }
 
 driver_of(){
   local slot="${1:-}"
   [[ -n "$slot" ]] || { echo "none"; return 0; }
-  local p="$(pci_path "$slot")/driver"
+  slot="$(normalize_slot "$slot")"
+  local p="/sys/bus/pci/devices/${slot}/driver"
   [[ -L "$p" ]] && basename "$(readlink -f "$p")" || echo "none"
 }
 
 bind_to(){
   local drv="${1:-}" slot="${2:-}"
   [[ -n "$drv" && -n "$slot" ]] || { note "bind_to: ontbrekende args (drv='$drv', slot='$slot')"; return 0; }
+  slot="$(normalize_slot "$slot")"
   local drvdir="/sys/bus/pci/drivers/${drv}"
   [[ -d "$drvdir" ]] || modprobe "$drv" >/dev/null 2>&1 || true
-  echo "${slot#0000:}" > "${drvdir}/bind" 2>/dev/null || true
+  echo "${slot}" > "${drvdir}/bind" 2>/dev/null || true
 }
 
 unbind_from(){
   local drv="${1:-}" slot="${2:-}"
   [[ -n "$drv" && -n "$slot" ]] || { note "unbind_from: ontbrekende args (drv='$drv', slot='$slot')"; return 0; }
+  slot="$(normalize_slot "$slot")"
   local drvdir="/sys/bus/pci/drivers/${drv}"
-  [[ -d "$drvdir" ]] && echo "${slot#0000:}" > "${drvdir}/unbind" 2>/dev/null || true
+  [[ -d "$drvdir" ]] && echo "${slot}" > "${drvdir}/unbind" 2>/dev/null || true
 }
 
 # ---------- kernel cmdline helpers ----------
