@@ -45,22 +45,40 @@ yn(){
 # ---------------- detect GPU/audio ----------------
 GPU_SLOT=""; GPU_ID=""
 AUDIO_SLOT=""; AUDIO_ID=""
-detect_devices(){
+detect_devices() {
   have lspci || err "lspci not found (install: apt install pciutils)"
-  local line
-  # Pak AMD VGA/Display controller
-  line="$(lspci -Dnns | awk '/\[1002:.*\].*(VGA compatible controller|Display controller)/{print; exit}')"
-  [[ -n "$line" ]] || err "Geen AMD GPU gevonden via lspci"
-  GPU_SLOT="$(awk '{print $1}' <<<"$line")"
-  GPU_ID="$(awk -F'[][]' '{print $2}' <<<"$line")"
 
-  # Audio meestal .1
-  AUDIO_SLOT="$(sed 's/\.[0-9]\+$/\.1/' <<<"$GPU_SLOT")"
-  if [[ -d "$(pci_path "$AUDIO_SLOT")" ]]; then
-    local aline; aline="$(lspci -Dnns -s "$AUDIO_SLOT" || true)"
-    AUDIO_ID="$(awk -F'[][]' '{print $2}' <<<"$aline")"
+  # Zoek AMD VGA/Display controller
+  local all
+  all="$(lspci -Dnns 2>/dev/null)"
+
+  local line
+  line="$(awk '/\[1002:.*\].*(VGA compatible controller|Display controller)/{print; exit}' <<<"$all")"
+  [[ -n "$line" ]] || err "Geen AMD GPU gevonden via lspci"
+
+  GPU_SLOT="$(awk '{print $1}' <<<"$line")"
+  GPU_ID="$(awk -F'[][]' '{print $2}' <<<"$line")"   # bv 1002:150e
+
+  # Probeer audio op hetzelfde bus:slot, functie .1
+  local base="${GPU_SLOT%.*}"           # bus:slot
+  AUDIO_SLOT="${base}.1"
+
+  if [[ -d "/sys/bus/pci/devices/0000:${AUDIO_SLOT}" ]]; then
+    # Pak audio-regel uit volledige dump i.p.v. lspci -s (voorkomt -s zonder arg)
+    local aline
+    aline="$(awk -v pat="^${AUDIO_SLOT}[[:space:]]" '$0 ~ pat {print; found=1} found && NR<=NR+0' <<<"$all")"
+    # Als die regel niet matcht (sommige platforms), zoek generiek op Audio met dezelfde vendor 1002
+    if [[ -z "$aline" ]]; then
+      aline="$(awk -v prefix="$base" '/\[1002:.*\].*Audio/{ if(index($1,prefix".1")==1){print; exit}}' <<<"$all")"
+    fi
+    if [[ -n "$aline" ]]; then
+      AUDIO_ID="$(awk -F'[][]' '{print $2}' <<<"$aline")"
+    else
+      note "Audio-functie ${AUDIO_SLOT} niet gevonden in lspci-uitvoer; ga verder zonder audio."
+      AUDIO_SLOT=""; AUDIO_ID=""
+    fi
   else
-    note "Audio-functie ${AUDIO_SLOT} niet gevonden; ga verder zonder audio."
+    note "Audio-functie ${AUDIO_SLOT} bestaat niet; ga verder zonder audio."
     AUDIO_SLOT=""; AUDIO_ID=""
   fi
 }
