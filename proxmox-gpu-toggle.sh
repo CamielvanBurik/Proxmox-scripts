@@ -1,71 +1,98 @@
 #!/usr/bin/env bash
 # Toggle AMD iGPU between host (amdgpu) and passthrough (vfio-pci)
-# Usage: gpu-toggle.sh host|passthrough|status
-
+# - Zonder parameters start een interactieve wizard
+# - Subcommands blijven werken: gpu-toggle.sh host|passthrough|status
 set -euo pipefail
 
 VFIO_CONF="/etc/modprobe.d/vfio.conf"
 AMDGPU_ML="/etc/modules-load.d/amdgpu.conf"
 
-# --- helpers ---------------------------------------------------------------
-err() { echo "ERROR: $*" >&2; exit 1; }
-msg() { echo "[*] $*"; }
+# -------------------- helpers --------------------
+err(){ echo "ERROR: $*" >&2; exit 1; }
+msg(){ echo "[*] $*"; }
+note(){ echo "[-] $*"; }
+ok(){ echo "[OK] $*"; }
 
-need_root() { [[ $(id -u) -eq 0 ]] || err "Run as root"; }
-have() { command -v "$1" >/dev/null 2>&1; }
+need_root(){ [[ $(id -u) -eq 0 ]] || err "Run as root"; }
+have(){ command -v "$1" >/dev/null 2>&1; }
 
-pci_path() {
-  local slot="$1"
-  echo "/sys/bus/pci/devices/0000:${slot}"
-}
+pci_path(){ local slot="$1"; echo "/sys/bus/pci/devices/0000:${slot}"; }
 
-driver_of() {
-  local slot="$1"
-  local p="$(pci_path "$slot")/driver"
+driver_of(){
+  local slot="$1" p="$(pci_path "$slot")/driver"
   [[ -L "$p" ]] && basename "$(readlink -f "$p")" || echo "none"
 }
 
-bind_to() {
-  local drv="$1" slot="$2"
-  local drvdir="/sys/bus/pci/drivers/${drv}"
-  [[ -d "$drvdir" ]] || modprobe "$drv" || true
+bind_to(){
+  local drv="$1" slot="$2" drvdir="/sys/bus/pci/drivers/${drv}"
+  [[ -d "$drvdir" ]] || modprobe "$drv" >/dev/null 2>&1 || true
   echo "0000:${slot}" > "${drvdir}/bind" 2>/dev/null || true
 }
 
-unbind_from() {
-  local drv="$1" slot="$2"
-  local drvdir="/sys/bus/pci/drivers/${drv}"
+unbind_from(){
+  local drv="$1" slot="$2" drvdir="/sys/bus/pci/drivers/${drv}"
   [[ -d "$drvdir" ]] && echo "0000:${slot}" > "${drvdir}/unbind" 2>/dev/null || true
 }
 
-# --- detect GPU + audio ----------------------------------------------------
-detect_devices() {
-  have lspci || err "lspci not found (install: pciutils)"
+yn(){
+  # yn "Vraag?" Y|N
+  local q="$1" dflt="${2:-Y}" a
+  read -r -p "$q [$dflt] " a || true
+  a="${a:-$dflt}"
+  [[ "$a" =~ ^[Yy]$ ]]
+}
 
-  # Zoek AMD Display controller (0380) of VGA (0300/0380) met vendor 1002
+# ---------------- detect GPU/audio ----------------
+GPU_SLOT=""; GPU_ID=""
+AUDIO_SLOT=""; AUDIO_ID=""
+detect_devices(){
+  have lspci || err "lspci not found (install: apt install pciutils)"
   local line
-  line="$(lspci -Dnns | awk '/\[1002:.*\].*(VGA compatible controller|Display controller)/ {print $0}' | head -n1)"
-  [[ -n "${line}" ]] || err "Geen AMD GPU gevonden via lspci"
-
+  # Pak AMD VGA/Display controller
+  line="$(lspci -Dnns | awk '/\[1002:.*\].*(VGA compatible controller|Display controller)/{print; exit}')"
+  [[ -n "$line" ]] || err "Geen AMD GPU gevonden via lspci"
   GPU_SLOT="$(awk '{print $1}' <<<"$line")"
-  GPU_ID="$(awk -F'[][]' '{print $2}' <<<"$line")"      # bv 1002:150e
+  GPU_ID="$(awk -F'[][]' '{print $2}' <<<"$line")"
 
-  # Audio-functie = zelfde device, functie .1 (meestal zo bij AMD)
-  AUDIO_SLOT="$(sed 's/\.[0-9]\+$/.1/' <<<"$GPU_SLOT")"
-  # Bevestig dat .1 bestaat; zo niet, probeer .0 te hergebruiken (geen audio)
-  if [[ ! -d "$(pci_path "$AUDIO_SLOT")" ]]; then
-    msg "Waarschuwing: kon audio-functie ${AUDIO_SLOT} niet vinden; ga verder zonder audio."
-    AUDIO_SLOT=""
-    AUDIO_ID=""
+  # Audio meestal .1
+  AUDIO_SLOT="$(sed 's/\.[0-9]\+$/\.1/' <<<"$GPU_SLOT")"
+  if [[ -d "$(pci_path "$AUDIO_SLOT")" ]]; then
+    local aline; aline="$(lspci -Dnns -s "$AUDIO_SLOT" || true)"
+    AUDIO_ID="$(awk -F'[][]' '{print $2}' <<<"$aline")"
   else
-    local aline
-    aline="$(lspci -Dnns -s "$AUDIO_SLOT" || true)"
-    AUDIO_ID="$(awk -F'[][]' '{print $2}' <<<"$aline")" # bv 1002:1640
+    note "Audio-functie ${AUDIO_SLOT} niet gevonden; ga verder zonder audio."
+    AUDIO_SLOT=""; AUDIO_ID=""
   fi
 }
 
-# --- write vfio.conf -------------------------------------------------------
-write_vfio_conf() {
+iommu_flags(){
+  [[ -f /etc/kernel/cmdline ]] || { echo "(no /etc/kernel/cmdline)"; return; }
+  grep -Eo 'amd_iommu=[^ ]+|iommu=pt|video=efifb:[^ ]+' /etc/kernel/cmdline || true
+}
+
+vfio_present(){
+  [[ -f "$VFIO_CONF" ]] && echo "present" || echo "absent"
+}
+
+render_nodes(){
+  ls -1 /dev/dri 2>/dev/null | sed 's/^/\/dev\/dri\//' || true
+}
+
+show_status(){
+  detect_devices
+  echo "=== Huidige status ==="
+  echo "GPU   : $GPU_SLOT (id $GPU_ID) -> driver: $(driver_of "$GPU_SLOT")"
+  if [[ -n "$AUDIO_SLOT" ]]; then
+    echo "Audio : $AUDIO_SLOT (id ${AUDIO_ID:-unknown}) -> driver: $(driver_of "$AUDIO_SLOT")"
+  fi
+  echo "vfio.conf : $(vfio_present)"
+  echo "Kernel cmdline flags : $(iommu_flags)"
+  echo "Render nodes :"; render_nodes | sed 's/^/  /'
+  echo "======================"
+}
+
+# -------------- persistent config ---------------
+write_vfio_conf(){
   [[ -n "${GPU_ID:-}" ]] || err "GPU_ID niet bekend"
   msg "Schrijf ${VFIO_CONF} (vfio-pci ids=${GPU_ID}${AUDIO_ID:+,${AUDIO_ID}})"
   cat >"$VFIO_CONF" <<EOF
@@ -74,88 +101,122 @@ options vfio-pci ids=${GPU_ID}${AUDIO_ID:+,${AUDIO_ID}}
 softdep amdgpu pre: vfio-pci
 blacklist amdgpu
 blacklist radeon
-# blacklist snd_hda_intel  # (uncomment als je audio ook altijd passthrought)
+# blacklist snd_hda_intel
 EOF
 }
 
-disable_vfio_conf() {
+disable_vfio_conf(){
   if [[ -f "$VFIO_CONF" ]]; then
     msg "Disable ${VFIO_CONF}"
     mv "$VFIO_CONF" "${VFIO_CONF}.disabled.$(date +%s)"
   fi
 }
 
-ensure_amdgpu_autoload() {
-  echo amdgpu > "$AMDGPU_ML"
-}
+ensure_amdgpu_autoload(){ echo amdgpu > "$AMDGPU_ML"; }
 
-# --- modes -----------------------------------------------------------------
-do_status() {
-  detect_devices
-  echo "GPU  : ${GPU_SLOT} (id ${GPU_ID}) -> driver: $(driver_of "$GPU_SLOT")"
-  if [[ -n "${AUDIO_SLOT}" ]]; then
-    echo "Audio: ${AUDIO_SLOT} (id ${AUDIO_ID:-unknown}) -> driver: $(driver_of "$AUDIO_SLOT")"
+ensure_iommu(){
+  # Voeg flags toe indien niet aanwezig
+  local cmdline="/etc/kernel/cmdline"
+  [[ -f "$cmdline" ]] || { note "$cmdline ontbreekt; sla IOMMU-check over."; return; }
+  if ! grep -q 'amd_iommu=on' "$cmdline"; then
+    if yn "IOMMU niet gevonden. amd_iommu=on iommu=pt toevoegen aan kernel cmdline en refresh?" Y; then
+      sed -i 's/$/ amd_iommu=on iommu=pt/' "$cmdline"
+      proxmox-boot-tool refresh || true
+      ok "IOMMU flags toegevoegd. Reboot aanbevolen."
+    fi
   fi
-  echo
-  echo "vfio.conf: $( [[ -f $VFIO_CONF ]] && echo present || echo absent )"
-  echo "Kernel cmdline (IOMMU needed for passthrough):"
-  [[ -f /etc/kernel/cmdline ]] && grep -Eo 'amd_iommu=[^ ]+|iommu=pt' /etc/kernel/cmdline || echo "(no /etc/kernel/cmdline)"
 }
 
-do_host() {
+# ------------------- modes ----------------------
+do_host(){
   detect_devices
   msg "Schakel naar HOST (amdgpu)"
   disable_vfio_conf
   ensure_amdgpu_autoload
 
   modprobe amdgpu || true
-  # Live unbind van vfio en binden aan amdgpu/snd_hda_intel
   unbind_from vfio-pci "$GPU_SLOT"
   bind_to amdgpu "$GPU_SLOT"
 
-  if [[ -n "${AUDIO_SLOT}" ]]; then
+  if [[ -n "$AUDIO_SLOT" ]]; then
     modprobe snd_hda_intel || true
     unbind_from vfio-pci "$AUDIO_SLOT"
     bind_to snd_hda_intel "$AUDIO_SLOT"
   fi
 
   update-initramfs -u || true
-  echo
-  do_status
-  echo
-  echo "Let op: als X/KMS/VA-API nog niet werkt, doe een reboot."
+  ok "Host-mode geactiveerd (live). Reboot kan nog nodig zijn."
+  show_status
 }
 
-do_passthrough() {
+do_passthrough(){
   detect_devices
   msg "Schakel naar PASSTHROUGH (vfio-pci)"
   write_vfio_conf
   modprobe vfio-pci || true
 
-  # Live unbind van amdgpu/snd en binden aan vfio
   unbind_from amdgpu "$GPU_SLOT"
   bind_to vfio-pci "$GPU_SLOT"
 
-  if [[ -n "${AUDIO_SLOT}" ]]; then
+  if [[ -n "$AUDIO_SLOT" ]]; then
     unbind_from snd_hda_intel "$AUDIO_SLOT"
     bind_to vfio-pci "$AUDIO_SLOT"
   fi
 
+  ensure_iommu
   update-initramfs -u || true
-  echo
-  do_status
-  echo
-  echo "Tip: controleer dat je kernel-cmdline IOMMU aan heeft:"
-  echo "  grep -E 'amd_iommu=on|iommu=pt' /etc/kernel/cmdline"
-  echo "Zo niet, doe dan:"
-  echo "  sed -i 's|\$| amd_iommu=on iommu=pt|' /etc/kernel/cmdline && proxmox-boot-tool refresh && reboot"
+  ok "Passthrough-mode geactiveerd (live). Reboot sterk aanbevolen vóór VM-start."
+  show_status
 }
 
-# --- main ------------------------------------------------------------------
+# ------------------ wizard ----------------------
+wizard(){
+  show_status
+  echo
+  local cur="$(driver_of "$GPU_SLOT")"
+  local default=""
+  case "$cur" in
+    amdgpu) default="2" ;;   # voorstel: naar passthrough
+    vfio-pci) default="1" ;; # voorstel: naar host
+    *) default="3" ;;
+  esac
+
+  echo "Kies een actie:"
+  echo "  1) Switch naar HOST (amdgpu)"
+  echo "  2) Switch naar PASSTHROUGH (vfio-pci)"
+  echo "  3) Alleen status opnieuw tonen"
+  echo "  4) Alleen persist instellen (schrijf/disable vfio.conf) zonder live (un)bind"
+  echo "  5) Reboot nu"
+  echo "  0) Afsluiten"
+  read -r -p "Selectie [${default}]: " sel; sel="${sel:-$default}"
+
+  case "$sel" in
+    1) do_host ;;
+    2) do_passthrough ;;
+    3) show_status ;;
+    4)
+      if yn "Persist PASSTHROUGH schrijven (vfio.conf)?" N; then
+        detect_devices; write_vfio_conf; update-initramfs -u || true; ok "vfio.conf geschreven."
+      elif yn "Persist HOST instellen (vfio.conf uitzetten)?" Y; then
+        disable_vfio_conf; update-initramfs -u || true; ok "vfio.conf disabled."
+      fi
+      ;;
+    5) reboot ;;
+    0) exit 0 ;;
+    *) echo "Ongeldige keuze";;
+  esac
+
+  echo
+  if yn "Nog een actie uitvoeren?" N; then
+    wizard
+  fi
+}
+
+# ------------------- main -----------------------
 need_root
 case "${1:-}" in
   host)        do_host ;;
   passthrough) do_passthrough ;;
-  status)      do_status ;;
-  *) echo "Usage: $0 {host|passthrough|status}"; exit 2 ;;
+  status)      show_status ;;
+  *)           wizard ;;
 esac
