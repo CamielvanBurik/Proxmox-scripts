@@ -204,7 +204,6 @@ Render nodes :
 ```
 
 
-Top! Hier is een compacte **cheat sheet** die je naast je README kunt bewaren:
 
 ````markdown
 # Proxmox iGPU Passthrough Cheat Sheet
@@ -272,14 +271,6 @@ qm set 101 -hostpci1 0000:c5:00.1,pcie=1   # optioneel audio
   ```bash
   ls -l /dev/dri
   ```
-
-```
-
-Wil je dat ik dit cheat sheet **integreer in je README** (als sectie onderaan), of juist als een **los bestand** (`CHEATSHEET.md`) zodat je het apart bij de hand hebt?
-```
-
-
-
 
 
 ---
