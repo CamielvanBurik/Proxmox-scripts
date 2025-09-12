@@ -203,6 +203,85 @@ Render nodes :
 ======================
 ```
 
+
+Top! Hier is een compacte **cheat sheet** die je naast je README kunt bewaren:
+
+````markdown
+# Proxmox iGPU Passthrough Cheat Sheet
+
+## Status check
+```bash
+./proxmox-gpu-toggle.sh --slot 0000:c5:00.0 --audio-slot 0000:c5:00.1 status
+````
+
+→ Laat zien of de GPU/audio op `amdgpu` (host) of `vfio-pci` (passthrough) zit.
+
+---
+
+## Naar Passthrough (voor VM)
+
+```bash
+./proxmox-gpu-toggle.sh --slot 0000:c5:00.0 --audio-slot 0000:c5:00.1 passthrough
+```
+
+Check:
+
+```bash
+lspci -nnk -s c5:00.0
+lspci -nnk -s c5:00.1
+# Verwacht: Kernel driver in use: vfio-pci
+```
+
+---
+
+## Terug naar Host
+
+```bash
+./proxmox-gpu-toggle.sh --slot 0000:c5:00.0 --audio-slot 0000:c5:00.1 host
+```
+
+Check:
+
+```bash
+lspci -nnk -s c5:00.0
+# Verwacht: Kernel driver in use: amdgpu
+```
+
+---
+
+## VM Configuratie
+
+Toewijzen aan VM (voorbeeld VMID=101):
+
+```bash
+qm set 101 -hostpci0 0000:c5:00.0,pcie=1
+qm set 101 -hostpci1 0000:c5:00.1,pcie=1   # optioneel audio
+```
+
+---
+
+## Extra checks
+
+* IOMMU status:
+
+  ```bash
+  dmesg | grep -i iommu | tail
+  ```
+* Render nodes op host:
+
+  ```bash
+  ls -l /dev/dri
+  ```
+
+```
+
+Wil je dat ik dit cheat sheet **integreer in je README** (als sectie onderaan), of juist als een **los bestand** (`CHEATSHEET.md`) zodat je het apart bij de hand hebt?
+```
+
+
+
+
+
 ---
 
 ## Licentie
