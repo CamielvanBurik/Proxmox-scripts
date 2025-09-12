@@ -1,188 +1,215 @@
+Zeker! Hier is een **README.md** die past bij jouw `proxmox-gpu-toggle.sh`.
 
-# GPU Toggle (amdgpu ↔ vfio-pci) voor Proxmox 9 (Debian 13 Trixie)
+````markdown
+# Proxmox AMD iGPU Toggle (amdgpu ↔ vfio-pci)
 
-Dit script (`/usr/local/sbin/gpu-toggle.sh`) laat je snel wisselen tussen:
+`proxmox-gpu-toggle.sh` wisselt een **AMD iGPU** op een Proxmox-host tussen:
 
-* **Host-modus**: de AMD iGPU draait op de host met `amdgpu` (voor VA-API, OpenCL, Jellyfin, etc.)
-* **Passthrough-modus**: de iGPU (en audiofunctie) worden aan `vfio-pci` gebonden voor passthrough naar een VM.
+- **Host mode** — driver **`amdgpu`** (GPU voor de host),
+- **Passthrough mode** — driver **`vfio-pci`** (GPU voor een VM).
+
+Het script kan **live (un)binds** doen, **persistente** instellingen schrijven (bijv. `/etc/modprobe.d/vfio.conf`), en kernel-cmdline-opties beheren (zoals `amd_iommu=on`, `iommu=pt`, `video=efifb:off`). Inclusief wizard en handmatige overrides voor PCI-slots.
+
+---
 
 ## Kenmerken
 
-* Detecteert automatisch GPU- en audio-PCI slots en vendor ID’s.
-* Past `/etc/modprobe.d/vfio.conf` automatisch aan (aan/uit).
-* Probeert **live** te (un)bind’en zonder reboot; werkt ook met reboot.
-* Laat status zien (huidige driverbinding, kernel cmdline hints).
+- Automatische detectie van iGPU + (optioneel) iGPU-HDMI/DP-audio.
+- Live switchen tussen `amdgpu` en `vfio-pci`.
+- Schrijft/disable’t **`/etc/modprobe.d/vfio.conf`** met de juiste PCI IDs.
+- Houdt rekening met **Proxmox** boot (kan `proxmox-boot-tool refresh` uitvoeren).
+- Wizard met menu; non-interactief via subcommands/flags.
+- **Overtures**: `--slot` en `--audio-slot` om BDF’s te forceren (bijv. `0000:c5:00.0`).
 
 ---
 
 ## Vereisten
 
-* Proxmox VE 9.x (Debian 13 Trixie).
-* Rootrechten.
-* `pciutils` (voor `lspci`):
-
-  ```bash
-  apt install -y pciutils
-  ```
-* (Aanbevolen) Kernel ≥ 6.8 en firmware up-to-date:
-
-  ```bash
-  apt install -y pve-kernel-6.8 pve-firmware firmware-amd-graphics
-  ```
+- Proxmox host (root).
+- `pciutils` (`lspci`); wordt automatisch geïnstalleerd als `AUTO_INSTALL_DEPS=true`.
+- Kernel: IOMMU-ondersteuning (kan via script worden aangezet).
+- Aanbevolen voor passthrough: `video=efifb:off` (kan via script).
 
 ---
 
 ## Installatie
 
-1. Sla het script op:
-
 ```bash
-nano /usr/local/sbin/gpu-toggle.sh
-# (plak de inhoud van het script)
-chmod +x /usr/local/sbin/gpu-toggle.sh
-```
+# Plaats het script
+install -Dvm 0755 proxmox-gpu-toggle.sh /root/.cache/proxmox-scripts/repo/proxmox-gpu-toggle.sh
 
-2. (Optioneel) Voeg een korte alias toe:
-
-```bash
-echo 'alias gputoggle="/usr/local/sbin/gpu-toggle.sh"' >> /root/.bashrc
-```
+# (Optioneel) symlink in PATH
+ln -s /root/.cache/proxmox-scripts/repo/proxmox-gpu-toggle.sh /usr/local/sbin/gpu-toggle
+````
 
 ---
 
 ## Gebruik
 
-### Status
-
-Toont gedetecteerde GPU/audio en actieve driver:
+### Wizard (interactief)
 
 ```bash
-gpu-toggle.sh status
+/root/.cache/proxmox-scripts/repo/proxmox-gpu-toggle.sh
 ```
 
-### Host-modus (amdgpu)
+Toont status en een menu met acties:
 
-Gebruik de iGPU op de host (VA-API/OpenCL):
+* 1. Host (amdgpu)
+* 2. Passthrough (vfio-pci)
+* 3. Status opnieuw
+* 4. Alleen persisterende config (vfio.conf aan/uit)
+* 5. Reboot
+* 6. Toggle `video=efifb:off` + `proxmox-boot-tool refresh`
+
+### Subcommands (non-interactief)
 
 ```bash
-gpu-toggle.sh host
-# desnoods reboot voor ‘clean slate’
-reboot
+# Status
+proxmox-gpu-toggle.sh status
+
+# Naar passthrough en terug:
+proxmox-gpu-toggle.sh passthrough
+proxmox-gpu-toggle.sh host
 ```
 
-### Passthrough-modus (vfio-pci)
+### Handmatige PCI-slot overrides
 
-Bindt GPU + audio aan `vfio-pci` voor VM passthrough:
+Als autodetectie niet klopt of je wilt expliciet sturen:
 
 ```bash
-gpu-toggle.sh passthrough
+# Forceren met flags:
+proxmox-gpu-toggle.sh --slot 0000:c5:00.0 --audio-slot 0000:c5:00.1 status
+proxmox-gpu-toggle.sh --slot 0000:c5:00.0 --audio-slot 0000:c5:00.1 passthrough
+proxmox-gpu-toggle.sh --slot 0000:c5:00.0 host
+
+# Of via environment variables:
+GPU_SLOT=0000:c5:00.0 AUDIO_SLOT=0000:c5:00.1 proxmox-gpu-toggle.sh status
 ```
 
-**Belangrijk voor passthrough**: IOMMU moet aan staan. Eenmalig instellen:
-
-```bash
-sed -i 's/$/ amd_iommu=on iommu=pt/' /etc/kernel/cmdline
-proxmox-boot-tool refresh
-reboot
-```
+> **Tip:** laat `AUDIO_SLOT` leeg als je geen HDMI/DP-audio wil doorgeven.
 
 ---
 
-## Verifiëren
+## Wat het script precies doet
 
-* **Driverbinding**:
+* **Detectie**
 
-  ```bash
-  lspci -nnk | grep -A3 -E "VGA|Display|3D"
-  ```
+  * Zoekt AMD GPU via `lspci`, robuuste regex (class ↔ vendor volgorde).
+  * Audio: prefereert iGPU-HDMI/DP-audio (vendor `1002:`) op dezelfde bus.
+* **Host → Passthrough**
 
-  Verwacht:
+  * Schrijft `/etc/modprobe.d/vfio.conf` met `vfio-pci ids=...`.
+  * Laadt `vfio-pci`, unbind `amdgpu`, bind `vfio-pci` (en evt. audio).
+  * Controleert/zet IOMMU (`amd_iommu=on iommu=pt`) en kan boot refreshen.
+* **Passthrough → Host**
 
-  * Host-modus: `Kernel driver in use: amdgpu`
-  * Passthrough-modus: `Kernel driver in use: vfio-pci`
+  * Disable’t `vfio.conf`, zorgt dat `amdgpu` autoloaded.
+  * Unbind `vfio-pci`, bind `amdgpu` (en evt. `snd_hda_intel`).
+* **Kernel-cmdline beheer (optioneel)**
 
-* **Render device aanwezig (host-modus)**:
-
-  ```bash
-  ls -l /dev/dri
-  ```
-
-* **Video-accel en OpenCL (host-modus)**:
-
-  ```bash
-  apt install -y mesa-va-drivers vainfo mesa-opencl-icd ocl-icd-libopencl1 clinfo libclc-19 || true
-  vainfo | head
-  RUSTICL_ENABLE=radeonsi clinfo | grep -E 'Platform|Device'
-  ```
+  * Toggle **`video=efifb:off`** (handig om framebuffer te bevrijden).
+  * Voert `proxmox-boot-tool refresh` uit als aanwezig.
 
 ---
 
-## Veelvoorkomende issues & oplossingen
+## Veelvoorkomende workflows
 
-* **VM start niet / black screen bij passthrough**
+### 1) Eerste keer klaarmaken voor passthrough
 
-  * Gebruik VM-firmware **OVMF (UEFI)** en **Machine type: q35**.
-  * Voeg zowel **GPU (…:…:… .0)** als **Audio (… .1)** toe.
-  * Controleer IOMMU:
-
-    ```bash
-    dmesg | grep -E 'IOMMU|AMD-Vi'
-    ```
-
-* **`amdgpu` blijft niet binden**
-
-  * Kijk of er nog een blacklist of oude `vfio.conf` rondslingert:
-
-    ```bash
-    grep -RniE 'vfio-pci|blacklist.*amdgpu' /etc/modprobe.d/
-    ```
-  * Pas aan/verwijder, run `update-initramfs -u` en reboot.
-
-* **OpenCL zegt “0 devices, multiple matching platforms” (host-modus)**
-
-  * Houd alleen Mesa’s RustiCL ICD aan:
-
-    ```bash
-    mkdir -p /root/icd-backup
-    mv /etc/OpenCL/vendors/pocl.icd /root/icd-backup/ 2>/dev/null || true
-    echo "mesa" > /etc/OpenCL/vendors/mesa.icd
-    ```
-
-* **Firmware missing in dmesg**
-
-  * Update firmware:
-
-    ```bash
-    apt update
-    apt install -y pve-firmware firmware-amd-graphics
-    reboot
-    ```
-
----
-
-## Veiligheidsadvies
-
-* **Stop VM’s** die de GPU gebruiken vóór je togglet.
-* Gebruik **één** methode tegelijk: of host-gebruik, of passthrough.
-* Bij twijfel: run een **reboot** na het wisselen voor een schone toestand.
-
----
-
-## Rollback
-
-Mocht er iets misgaan:
+1. Run wizard → optie 6 → **`video=efifb:off`** toevoegen → refresh.
+2. Wizard vraagt voor IOMMU: **Ja** om `amd_iommu=on iommu=pt` toe te voegen → refresh.
+3. Reboot host.
+4. Zet GPU op **passthrough**:
 
 ```bash
-# vfio uitschakelen
-mv /etc/modprobe.d/vfio.conf /etc/modprobe.d/vfio.conf.disabled 2>/dev/null || true
-update-initramfs -u
-reboot
+proxmox-gpu-toggle.sh --slot 0000:c5:00.0 --audio-slot 0000:c5:00.1 passthrough
+```
+
+### 2) Snel wisselen
+
+```bash
+# Naar de host:
+proxmox-gpu-toggle.sh host
+
+# Naar passthrough:
+proxmox-gpu-toggle.sh passthrough
 ```
 
 ---
 
-## Support/Notes
+## Integratie met Proxmox VM-hooks (optioneel)
 
-* De audiofunctie zit meestal op hetzelfde device als de GPU met functie **`.1`** (bijv. `c5:00.1`).
-* Het script werkt ook als de audiofunctie ontbreekt; dan wordt alleen de GPU gewisseld.
-* Voor geavanceerde use-cases (multi-GPU, dGPU + iGPU) kun je het script uitbreiden met vaste PCI-slots.
+Automatiseer het wisselen rond VM-start/stop met een hookscript:
+
+```bash
+/var/lib/vz/snippets/gpu-vfio-hook.sh <vmid> pre-start   # zet naar passthrough
+/var/lib/vz/snippets/gpu-vfio-hook.sh <vmid> post-stop   # zet terug naar host
+```
+
+Koppel aan VM:
+
+```bash
+qm set <VMID> -hookscript local:snippets/gpu-vfio-hook.sh
+```
+
+Zie de aparte README van het hookscript voor details.
+
+---
+
+## Troubleshooting
+
+* **“Geen AMD GPU gevonden via lspci”**
+
+  * Controleer of je op de **host** zit (geen LXC/VM).
+  * `lspci -Dnn | egrep -i 'vga|display|amd|ati'`
+  * Forceer `--slot 0000:BB:DD.F`.
+
+* **Audio-functie niet gevonden**
+
+  * Sommige systemen exposen audio anders; laat `AUDIO_SLOT` leeg of forceer `--audio-slot 0000:c5:00.1`.
+
+* **GPU blijft aan host vastzitten**
+
+  * Zet `video=efifb:off` in de wizard.
+  * Controleer IOMMU-flags via `status`.
+  * Reboot nadat cmdline is aangepast.
+
+* **VM start niet met GPU**
+
+  * Controleer dat device gebonden is aan `vfio-pci` (via `status`).
+  * Gebruik hookscript zodat pre-start automatisch schakelt.
+
+---
+
+## Veiligheid & opmerkingen
+
+* **Root vereist.** Script stopt direct als je geen root bent.
+* **Initramfs** wordt geüpdatet; bij kernel-cmdline-wijzigingen is **reboot** nodig.
+* Het script is **idempotent** waar mogelijk (herhaalde aanroepen zijn veilig).
+
+---
+
+## Voorbeeldoutput
+
+```
+=== Huidige status ===
+GPU   : 0000:c5:00.0 (id 1002:150e) -> driver: amdgpu
+Audio : 0000:c5:00.1 (id 1002:1640) -> driver: snd_hda_intel
+vfio.conf : absent
+Kernel cmdline flags : amd_iommu=on iommu=pt video=efifb:off
+Render nodes :
+  /dev/dri/by-path
+  /dev/dri/card0
+======================
+```
+
+---
+
+## Licentie
+
+Vrij te gebruiken/aan te passen. Geen garanties; gebruik op eigen risico.
+
+```
+
+Wil je dat ik er nog een **mermaid-diagram** of een korte **“cheat sheet”** bij zet?
+```
