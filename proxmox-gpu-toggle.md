@@ -1,161 +1,188 @@
-GPU Toggle (amdgpu ↔ vfio-pci) voor Proxmox 9 (Debian 13 Trixie)
 
-Dit script (/usr/local/sbin/gpu-toggle.sh) laat je snel wisselen tussen:
+# GPU Toggle (amdgpu ↔ vfio-pci) voor Proxmox 9 (Debian 13 Trixie)
 
-Host-modus: de AMD iGPU draait op de host met amdgpu (voor VA-API, OpenCL, Jellyfin, etc.)
+Dit script (`/usr/local/sbin/gpu-toggle.sh`) laat je snel wisselen tussen:
 
-Passthrough-modus: de iGPU (en audiofunctie) worden aan vfio-pci gebonden voor passthrough naar een VM.
+* **Host-modus**: de AMD iGPU draait op de host met `amdgpu` (voor VA-API, OpenCL, Jellyfin, etc.)
+* **Passthrough-modus**: de iGPU (en audiofunctie) worden aan `vfio-pci` gebonden voor passthrough naar een VM.
 
-Kenmerken
+## Kenmerken
 
-Detecteert automatisch GPU- en audio-PCI slots en vendor ID’s.
+* Detecteert automatisch GPU- en audio-PCI slots en vendor ID’s.
+* Past `/etc/modprobe.d/vfio.conf` automatisch aan (aan/uit).
+* Probeert **live** te (un)bind’en zonder reboot; werkt ook met reboot.
+* Laat status zien (huidige driverbinding, kernel cmdline hints).
 
-Past /etc/modprobe.d/vfio.conf automatisch aan (aan/uit).
+---
 
-Probeert live te (un)bind’en zonder reboot; werkt ook met reboot.
+## Vereisten
 
-Laat status zien (huidige driverbinding, kernel cmdline hints).
+* Proxmox VE 9.x (Debian 13 Trixie).
+* Rootrechten.
+* `pciutils` (voor `lspci`):
 
-Vereisten
+  ```bash
+  apt install -y pciutils
+  ```
+* (Aanbevolen) Kernel ≥ 6.8 en firmware up-to-date:
 
-Proxmox VE 9.x (Debian 13 Trixie).
+  ```bash
+  apt install -y pve-kernel-6.8 pve-firmware firmware-amd-graphics
+  ```
 
-Rootrechten.
+---
 
-pciutils (voor lspci):
+## Installatie
 
-apt install -y pciutils
+1. Sla het script op:
 
-
-(Aanbevolen) Kernel ≥ 6.8 en firmware up-to-date:
-
-apt install -y pve-kernel-6.8 pve-firmware firmware-amd-graphics
-
-Installatie
-
-Sla het script op:
-
+```bash
 nano /usr/local/sbin/gpu-toggle.sh
 # (plak de inhoud van het script)
 chmod +x /usr/local/sbin/gpu-toggle.sh
+```
 
+2. (Optioneel) Voeg een korte alias toe:
 
-(Optioneel) Voeg een korte alias toe:
-
+```bash
 echo 'alias gputoggle="/usr/local/sbin/gpu-toggle.sh"' >> /root/.bashrc
+```
 
-Gebruik
-Status
+---
+
+## Gebruik
+
+### Status
 
 Toont gedetecteerde GPU/audio en actieve driver:
 
+```bash
 gpu-toggle.sh status
+```
 
-Host-modus (amdgpu)
+### Host-modus (amdgpu)
 
 Gebruik de iGPU op de host (VA-API/OpenCL):
 
+```bash
 gpu-toggle.sh host
 # desnoods reboot voor ‘clean slate’
 reboot
+```
 
-Passthrough-modus (vfio-pci)
+### Passthrough-modus (vfio-pci)
 
-Bindt GPU + audio aan vfio-pci voor VM passthrough:
+Bindt GPU + audio aan `vfio-pci` voor VM passthrough:
 
+```bash
 gpu-toggle.sh passthrough
+```
 
+**Belangrijk voor passthrough**: IOMMU moet aan staan. Eenmalig instellen:
 
-Belangrijk voor passthrough: IOMMU moet aan staan. Eenmalig instellen:
-
+```bash
 sed -i 's/$/ amd_iommu=on iommu=pt/' /etc/kernel/cmdline
 proxmox-boot-tool refresh
 reboot
+```
 
-Verifiëren
+---
 
-Driverbinding:
+## Verifiëren
 
-lspci -nnk | grep -A3 -E "VGA|Display|3D"
+* **Driverbinding**:
 
+  ```bash
+  lspci -nnk | grep -A3 -E "VGA|Display|3D"
+  ```
 
-Verwacht:
+  Verwacht:
 
-Host-modus: Kernel driver in use: amdgpu
+  * Host-modus: `Kernel driver in use: amdgpu`
+  * Passthrough-modus: `Kernel driver in use: vfio-pci`
 
-Passthrough-modus: Kernel driver in use: vfio-pci
+* **Render device aanwezig (host-modus)**:
 
-Render device aanwezig (host-modus):
+  ```bash
+  ls -l /dev/dri
+  ```
 
-ls -l /dev/dri
+* **Video-accel en OpenCL (host-modus)**:
 
+  ```bash
+  apt install -y mesa-va-drivers vainfo mesa-opencl-icd ocl-icd-libopencl1 clinfo libclc-19 || true
+  vainfo | head
+  RUSTICL_ENABLE=radeonsi clinfo | grep -E 'Platform|Device'
+  ```
 
-Video-accel en OpenCL (host-modus):
+---
 
-apt install -y mesa-va-drivers vainfo mesa-opencl-icd ocl-icd-libopencl1 clinfo libclc-19 || true
-vainfo | head
-RUSTICL_ENABLE=radeonsi clinfo | grep -E 'Platform|Device'
+## Veelvoorkomende issues & oplossingen
 
-Veelvoorkomende issues & oplossingen
+* **VM start niet / black screen bij passthrough**
 
-VM start niet / black screen bij passthrough
+  * Gebruik VM-firmware **OVMF (UEFI)** en **Machine type: q35**.
+  * Voeg zowel **GPU (…:…:… .0)** als **Audio (… .1)** toe.
+  * Controleer IOMMU:
 
-Gebruik VM-firmware OVMF (UEFI) en Machine type: q35.
+    ```bash
+    dmesg | grep -E 'IOMMU|AMD-Vi'
+    ```
 
-Voeg zowel GPU (…:…:… .0) als Audio (… .1) toe.
+* **`amdgpu` blijft niet binden**
 
-Controleer IOMMU:
+  * Kijk of er nog een blacklist of oude `vfio.conf` rondslingert:
 
-dmesg | grep -E 'IOMMU|AMD-Vi'
+    ```bash
+    grep -RniE 'vfio-pci|blacklist.*amdgpu' /etc/modprobe.d/
+    ```
+  * Pas aan/verwijder, run `update-initramfs -u` en reboot.
 
+* **OpenCL zegt “0 devices, multiple matching platforms” (host-modus)**
 
-amdgpu blijft niet binden
+  * Houd alleen Mesa’s RustiCL ICD aan:
 
-Kijk of er nog een blacklist of oude vfio.conf rondslingert:
+    ```bash
+    mkdir -p /root/icd-backup
+    mv /etc/OpenCL/vendors/pocl.icd /root/icd-backup/ 2>/dev/null || true
+    echo "mesa" > /etc/OpenCL/vendors/mesa.icd
+    ```
 
-grep -RniE 'vfio-pci|blacklist.*amdgpu' /etc/modprobe.d/
+* **Firmware missing in dmesg**
 
+  * Update firmware:
 
-Pas aan/verwijder, run update-initramfs -u en reboot.
+    ```bash
+    apt update
+    apt install -y pve-firmware firmware-amd-graphics
+    reboot
+    ```
 
-OpenCL zegt “0 devices, multiple matching platforms” (host-modus)
+---
 
-Houd alleen Mesa’s RustiCL ICD aan:
+## Veiligheidsadvies
 
-mkdir -p /root/icd-backup
-mv /etc/OpenCL/vendors/pocl.icd /root/icd-backup/ 2>/dev/null || true
-echo "mesa" > /etc/OpenCL/vendors/mesa.icd
+* **Stop VM’s** die de GPU gebruiken vóór je togglet.
+* Gebruik **één** methode tegelijk: of host-gebruik, of passthrough.
+* Bij twijfel: run een **reboot** na het wisselen voor een schone toestand.
 
+---
 
-Firmware missing in dmesg
-
-Update firmware:
-
-apt update
-apt install -y pve-firmware firmware-amd-graphics
-reboot
-
-Veiligheidsadvies
-
-Stop VM’s die de GPU gebruiken vóór je togglet.
-
-Gebruik één methode tegelijk: of host-gebruik, of passthrough.
-
-Bij twijfel: run een reboot na het wisselen voor een schone toestand.
-
-Rollback
+## Rollback
 
 Mocht er iets misgaan:
 
+```bash
 # vfio uitschakelen
 mv /etc/modprobe.d/vfio.conf /etc/modprobe.d/vfio.conf.disabled 2>/dev/null || true
 update-initramfs -u
 reboot
+```
 
-Support/Notes
+---
 
-De audiofunctie zit meestal op hetzelfde device als de GPU met functie .1 (bijv. c5:00.1).
+## Support/Notes
 
-Het script werkt ook als de audiofunctie ontbreekt; dan wordt alleen de GPU gewisseld.
-
-Voor geavanceerde use-cases (multi-GPU, dGPU + iGPU) kun je het script uitbreiden met vaste PCI-slots.
+* De audiofunctie zit meestal op hetzelfde device als de GPU met functie **`.1`** (bijv. `c5:00.1`).
+* Het script werkt ook als de audiofunctie ontbreekt; dan wordt alleen de GPU gewisseld.
+* Voor geavanceerde use-cases (multi-GPU, dGPU + iGPU) kun je het script uitbreiden met vaste PCI-slots.
