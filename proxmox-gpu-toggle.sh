@@ -153,38 +153,41 @@ detect_devices(){
   [[ "$GPU_SLOT" =~ ^0000: ]] || GPU_SLOT="0000:${GPU_SLOT}"
   GPU_ID="$(grep -o '\[1002:[0-9a-fA-F]\{4\}\]' <<<"$line" | head -n1 | tr -d '[]')"
 
-  # AUDIO: expliciet opgegeven wint. Anders probeer .1, anders zoek "Audio" op dezelfde bus.
+  # ---------------- AUDIO-detectie (lspci-first) ----------------
+  # 1) Als expliciet opgegeven, gebruik die; anders probeer <gpu>.1 als kandidaat.
   if [[ -z "${AUDIO_SLOT:-}" ]]; then
     local base="${GPU_SLOT%.*}"
     AUDIO_SLOT="${base}.1"
-    if [[ ! -d "/sys/bus/pci/devices/${AUDIO_SLOT#0000:}" ]]; then
-      # zoek op dezelfde bus naar "Audio"
-      local bus="${base%:*}:"
-      AUDIO_SLOT="$(awk -v pfx="$bus" '$0 ~ "^"pfx && /Audio device|Audio Controller|Audio/{print $1; exit}' <<<"$all" || true)"
-      if [[ -n "${AUDIO_SLOT:-}" && ! "$AUDIO_SLOT" =~ ^0000: ]]; then
-        AUDIO_SLOT="0000:${AUDIO_SLOT}"
-      fi
-    fi
   fi
 
-  if [[ -n "${AUDIO_SLOT:-}" && -d "/sys/bus/pci/devices/${AUDIO_SLOT#0000:}" ]]; then
-    local aline
+  # 2) Probeer lspci-regel te vinden voor AUDIO_SLOT; zo niet, zoek op dezelfde bus.
+  local aline=""
+  if [[ -n "${AUDIO_SLOT:-}" ]]; then
     aline="$(grep -E "^${AUDIO_SLOT}[[:space:]]|^${AUDIO_SLOT#0000:}[[:space:]]" <<<"$all" || true)"
-    if [[ -z "$aline" ]]; then
-      aline="$(awk -v s="${AUDIO_SLOT#0000:}" '$1==s{print; exit}' <<<"$all" || true)"
-    fi
-    if [[ -n "$aline" ]]; then
-      AUDIO_ID="$(grep -o '\[1002:[0-9a-fA-F]\{4\}\]' <<<"$aline" | head -n1 | tr -d '[]')"
-    else
-      note "Audio-functie ${AUDIO_SLOT} niet gevonden in lspci-uitvoer; ga verder zonder audio."
+  fi
+  if [[ -z "$aline" ]]; then
+    # Zoek op dezelfde gbus (segment:slot) naar AMD Audio eerst, anders 'Audio' generiek.
+    local gbus="${GPU_SLOT#0000:}"   # bijv. c5:00.0
+    gbus="${gbus%%:*}:"              # -> c5:
+    # voorkeur: AMD (vendor 1002) audio op dezelfde bus
+    aline="$(awk -v gbus="$gbus" '
+      $1 ~ "^"gbus && /Audio/ && /\[1002:[0-9a-fA-F]{4}\]/ {print; exit}
+    ' <<<"$all" || true)"
+    # fallback: eender audio op dezelfde bus
+    [[ -n "$aline" ]] || aline="$(awk -v gbus="$gbus" '$1 ~ "^"gbus && /Audio/ {print; exit}' <<<"$all" || true)"
+  fi
+
+  # 3) Valideer vendor: alleen AMD (1002) HDMI/DP audio meenemen; anders leeg laten.
+  if [[ -n "$aline" ]]; then
+    AUDIO_SLOT="$(awk '{print $1}' <<<"$aline")"
+    [[ "$AUDIO_SLOT" =~ ^0000: ]] || AUDIO_SLOT="0000:${AUDIO_SLOT}"
+    AUDIO_ID="$(grep -o '\[1002:[0-9a-fA-F]\{4\}\]' <<<"$aline" | head -n1 | tr -d '[]')"
+    if [[ -z "$AUDIO_ID" || "$AUDIO_ID" != 1002:* ]]; then
+      note "Gevonden audio op ${AUDIO_SLOT}, maar geen AMD (iGPU) — onboard HDA? Ga verder zonder audio-bind."
       AUDIO_SLOT=""; AUDIO_ID=""
     fi
   else
-    if [[ -n "${AUDIO_SLOT:-}" ]]; then
-      note "Audio-functie ${AUDIO_SLOT} bestaat niet; ga verder zonder audio."
-    else
-      note "Geen audio-slot gedetecteerd; ga verder zonder audio."
-    fi
+    note "Geen iGPU-audio gevonden op dezelfde bus; ga verder zonder audio."
     AUDIO_SLOT=""; AUDIO_ID=""
   fi
 }
