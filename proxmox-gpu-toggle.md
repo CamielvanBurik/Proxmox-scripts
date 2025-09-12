@@ -211,5 +211,3 @@ Vrij te gebruiken/aan te passen. Geen garanties; gebruik op eigen risico.
 
 ```
 
-Wil je dat ik er nog een **mermaid-diagram** of een korte **“cheat sheet”** bij zet?
-```
