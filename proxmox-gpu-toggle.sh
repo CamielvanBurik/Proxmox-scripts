@@ -16,6 +16,7 @@ echo "[gpu-toggle] start $(date '+%F %T')"
 
 VFIO_CONF="/etc/modprobe.d/vfio.conf"
 AMDGPU_ML="/etc/modules-load.d/amdgpu.conf"
+CMDLINE="/etc/kernel/cmdline"
 
 # Optioneel: auto-install van minimale deps (alleen pciutils voor lspci)
 AUTO_INSTALL_DEPS="${AUTO_INSTALL_DEPS:-true}"
@@ -110,14 +111,76 @@ unbind_from(){
   [[ -d "$drvdir" ]] && echo "${slot#0000:}" > "${drvdir}/unbind" 2>/dev/null || true
 }
 
+# ---------- kernel cmdline helpers ----------
+cmdline_present(){ [[ -f "$CMDLINE" ]]; }
+cmdline_has(){
+  local flag="${1:-}"; cmdline_present || return 1
+  grep -qE "(^|[[:space:]])${flag}([[:space:]]|\$)" "$CMDLINE"
+}
+cmdline_add(){
+  local flag="${1:-}"; cmdline_present || { note "$CMDLINE ontbreekt; skip add '$flag'"; return 0; }
+  cmdline_has "$flag" && { note "'$flag' staat al in $CMDLINE"; return 0; }
+  sed -i "s/\$/ ${flag}/" "$CMDLINE"
+  ok "Toegevoegd aan cmdline: $flag"
+}
+cmdline_remove(){
+  local flag="${1:-}"; cmdline_present || { note "$CMDLINE ontbreekt; skip remove '$flag'"; return 0; }
+  # verwijder exact token, normaliseer dubbele spaces
+  sed -i -E "s/(^|[[:space:]])${flag}([[:space:]]|$)/ /g; s/[[:space:]]+/ /g; s/^ //; s/ $//" "$CMDLINE"
+  ok "Verwijderd uit cmdline: $flag"
+}
+cmdline_refresh(){
+  if have proxmox-boot-tool; then
+    proxmox-boot-tool refresh || true
+    ok "proxmox-boot-tool refresh uitgevoerd."
+  else
+    note "proxmox-boot-tool niet gevonden; voer zelf een bootloader refresh uit indien nodig."
+  fi
+}
+
+ensure_iommu(){
+  cmdline_present || { note "$CMDLINE ontbreekt; sla IOMMU-check over."; return; }
+  if ! cmdline_has "amd_iommu=on"; then
+    if yn "IOMMU niet gevonden. amd_iommu=on iommu=pt toevoegen en refresh?" Y; then
+      cmdline_add "amd_iommu=on"
+      cmdline_has "iommu=pt" || cmdline_add "iommu=pt"
+      cmdline_refresh
+      ok "IOMMU flags toegevoegd. Reboot aanbevolen."
+    fi
+  fi
+}
+
+ensure_efifb(){
+  cmdline_present || { note "$CMDLINE ontbreekt; sla efifb-check over."; return; }
+  if cmdline_has "video=efifb:off"; then
+    if yn "video=efifb:off staat AAN. Wil je deze VERWIJDEREN en refresh uitvoeren?" N; then
+      cmdline_remove "video=efifb:off"
+      cmdline_refresh
+      ok "efifb weer ingeschakeld (flag verwijderd). Reboot aanbevolen."
+    fi
+  else
+    if yn "video=efifb:off staat UIT. Wil je deze TOEVOEGEN en refresh uitvoeren?" Y; then
+      cmdline_add "video=efifb:off"
+      cmdline_refresh
+      ok "efifb uitgeschakeld (flag toegevoegd). Reboot aanbevolen."
+    fi
+  fi
+}
+
+iommu_flags(){
+  cmdline_present || { echo "(no /etc/kernel/cmdline)"; return; }
+  grep -Eo 'amd_iommu=[^ ]+|iommu=pt|video=efifb:[^ ]+' "$CMDLINE" || true
+}
+
+vfio_present(){ [[ -f "$VFIO_CONF" ]] && echo "present" || echo "absent"; }
+render_nodes(){ ls -1 /dev/dri 2>/dev/null | sed 's/^/\/dev\/dri\//' || true; }
+
 # ---------------- detect GPU/audio ----------------
 GPU_SLOT="${GPU_SLOT:-}"; GPU_ID=""
 AUDIO_SLOT="${AUDIO_SLOT:-}"; AUDIO_ID=""
 
 detect_devices(){
   have lspci || err "lspci not found (install: apt install pciutils)"
-
-  # Haal PCI-lijst op; laat het script niet falen als lspci non-zero geeft
   local all line
   all="$(lspci -Dnn 2>/dev/null || true)"
   [[ -n "$all" ]] || err "lspci gaf geen output; draai op de host (niet in LXC) en check pciutils."
@@ -149,35 +212,25 @@ detect_devices(){
   [[ -n "$line" ]] || err "Geen AMD GPU gevonden via lspci (/sys fallback faalde ook)"
 
   GPU_SLOT="$(awk '{print $1}' <<<"$line")"
-  # Normaliseer naar 0000: domain-prefix
   [[ "$GPU_SLOT" =~ ^0000: ]] || GPU_SLOT="0000:${GPU_SLOT}"
   GPU_ID="$(grep -o '\[1002:[0-9a-fA-F]\{4\}\]' <<<"$line" | head -n1 | tr -d '[]')"
 
-  # ---------------- AUDIO-detectie (lspci-first) ----------------
-  # 1) Als expliciet opgegeven, gebruik die; anders probeer <gpu>.1 als kandidaat.
+  # ---- AUDIO-detectie (lspci-first) ----
   if [[ -z "${AUDIO_SLOT:-}" ]]; then
     local base="${GPU_SLOT%.*}"
     AUDIO_SLOT="${base}.1"
   fi
 
-  # 2) Probeer lspci-regel te vinden voor AUDIO_SLOT; zo niet, zoek op dezelfde bus.
   local aline=""
   if [[ -n "${AUDIO_SLOT:-}" ]]; then
     aline="$(grep -E "^${AUDIO_SLOT}[[:space:]]|^${AUDIO_SLOT#0000:}[[:space:]]" <<<"$all" || true)"
   fi
   if [[ -z "$aline" ]]; then
-    # Zoek op dezelfde gbus (segment:slot) naar AMD Audio eerst, anders 'Audio' generiek.
-    local gbus="${GPU_SLOT#0000:}"   # bijv. c5:00.0
-    gbus="${gbus%%:*}:"              # -> c5:
-    # voorkeur: AMD (vendor 1002) audio op dezelfde bus
-    aline="$(awk -v gbus="$gbus" '
-      $1 ~ "^"gbus && /Audio/ && /\[1002:[0-9a-fA-F]{4}\]/ {print; exit}
-    ' <<<"$all" || true)"
-    # fallback: eender audio op dezelfde bus
-    [[ -n "$aline" ]] || aline="$(awk -v gbus="$gbus" '$1 ~ "^"gbus && /Audio/ {print; exit}' <<<"$all" || true)"
+    local gbus="${GPU_SLOT#0000:}"; gbus="${gbus%%:*}:"
+    aline="$(awk -v gbus="$gbus" '$1 ~ "^"gbus && /Audio/ && /\[1002:[0-9a-fA-F]{4}\]/{print; exit}' <<<"$all" || true)"
+    [[ -n "$aline" ]] || aline="$(awk -v gbus="$gbus" '$1 ~ "^"gbus && /Audio/{print; exit}' <<<"$all" || true)"
   fi
 
-  # 3) Valideer vendor: alleen AMD (1002) HDMI/DP audio meenemen; anders leeg laten.
   if [[ -n "$aline" ]]; then
     AUDIO_SLOT="$(awk '{print $1}' <<<"$aline")"
     [[ "$AUDIO_SLOT" =~ ^0000: ]] || AUDIO_SLOT="0000:${AUDIO_SLOT}"
@@ -192,15 +245,6 @@ detect_devices(){
   fi
 }
 
-iommu_flags(){
-  [[ -f /etc/kernel/cmdline ]] || { echo "(no /etc/kernel/cmdline)"; return; }
-  grep -Eo 'amd_iommu=[^ ]+|iommu=pt|video=efifb:[^ ]+' /etc/kernel/cmdline || true
-}
-
-vfio_present(){ [[ -f "$VFIO_CONF" ]] && echo "present" || echo "absent"; }
-
-render_nodes(){ ls -1 /dev/dri 2>/dev/null | sed 's/^/\/dev\/dri\//' || true; }
-
 show_status(){
   detect_devices
   echo "=== Huidige status ==="
@@ -208,7 +252,7 @@ show_status(){
   if [[ -n "${AUDIO_SLOT:-}" ]]; then
     echo "Audio : $AUDIO_SLOT (id ${AUDIO_ID:-unknown}) -> driver: $(driver_of "$AUDIO_SLOT")"
   fi
-  echo "vfio.conf : $(vfio_present)"
+  echo "vfio.conf : $( [[ -f "$VFIO_CONF" ]] && echo present || echo absent )"
   echo "Kernel cmdline flags : $(iommu_flags)"
   echo "Render nodes :"; render_nodes | sed 's/^/  /'
   echo "======================"
@@ -236,18 +280,6 @@ disable_vfio_conf(){
 }
 
 ensure_amdgpu_autoload(){ echo amdgpu > "$AMDGPU_ML"; }
-
-ensure_iommu(){
-  local cmdline="/etc/kernel/cmdline"
-  [[ -f "$cmdline" ]] || { note "$cmdline ontbreekt; sla IOMMU-check over."; return; }
-  if ! grep -q 'amd_iommu=on' "$cmdline"; then
-    if yn "IOMMU niet gevonden. amd_iommu=on iommu=pt toevoegen aan kernel cmdline en refresh?" Y; then
-      sed -i 's/$/ amd_iommu=on iommu=pt/' "$cmdline"
-      proxmox-boot-tool refresh || true
-      ok "IOMMU flags toegevoegd. Reboot aanbevolen."
-    fi
-  fi
-}
 
 # ------------------- modes ----------------------
 do_host(){
@@ -309,6 +341,7 @@ wizard(){
   echo "  3) Alleen status opnieuw tonen"
   echo "  4) Alleen persist instellen (schrijf/disable vfio.conf) zonder live (un)bind"
   echo "  5) Reboot nu"
+  echo "  6) Toggle efifb (video=efifb:off) + refresh"
   echo "  0) Afsluiten"
   local sel=""
   read_safe sel "Selectie [${default}]: " "$default"
@@ -325,6 +358,7 @@ wizard(){
       fi
       ;;
     5) reboot ;;
+    6) ensure_efifb ;;
     0) exit 0 ;;
     *) echo "Ongeldige keuze";;
   esac
@@ -336,7 +370,6 @@ wizard(){
 }
 
 # ------------------- arg parsing -----------------
-# parse optionele --slot / --audio-slot vóór subcommand
 SUBCMD=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
